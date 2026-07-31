@@ -210,6 +210,14 @@ pub enum AgentKind {
     Devin,
     /// Kimi Code CLI (Moonshot AI).
     KimiCode,
+    /// Amazon Kiro CLI (`kiro-cli`). Hooks are configured per-agent under
+    /// `.kiro/agents/<name>.json` (project) or `~/.kiro/agents/<name>.json`
+    /// (global) rather than one fixed settings file — see
+    /// `install-hooks --agent kiro`'s required `--config-file`. Kiro's hook
+    /// STDIN payload omits `session_id` (undocumented gap versus the
+    /// upstream docs); the native hook reads `KIRO_SESSION_ID` from the
+    /// environment instead (verified against kiro-cli 2.15.2).
+    Kiro,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -220,7 +228,7 @@ impl AgentKind {
     /// CHECK constraint accepts every kind (the Zero integration shipped
     /// with the enum variant but without the V26 migration and only a
     /// live test caught it). Extend together with the enum.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::OpenCode,
@@ -236,6 +244,7 @@ impl AgentKind {
         Self::Zero,
         Self::Devin,
         Self::KimiCode,
+        Self::Kiro,
         Self::Other,
     ];
 
@@ -258,6 +267,7 @@ impl AgentKind {
             Self::Zero => "zero",
             Self::Devin => "devin",
             Self::KimiCode => "kimi-code",
+            Self::Kiro => "kiro",
             Self::Other => "other",
         }
     }
@@ -283,6 +293,7 @@ impl AgentKind {
             "zero" => Self::Zero,
             "devin" => Self::Devin,
             "kimi-code" | "kimi" => Self::KimiCode,
+            "kiro" | "kiro-cli" => Self::Kiro,
             _ => Self::Other,
         }
     }

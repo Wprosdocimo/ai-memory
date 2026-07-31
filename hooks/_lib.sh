@@ -116,6 +116,19 @@ ai_memory_extract_session_id() {
     done
 }
 
+# Kiro's hook STDIN payload never carries session_id in any spelling
+# ai_memory_extract_session_id checks (a gap versus kiro-cli's own docs,
+# verified live against kiro-cli 2.15.2/2.16.0) — the real id is only
+# available via $KIRO_SESSION_ID. Unlike Devin's ai_memory_session_id_qs,
+# no synthesis/persistence is needed: kiro-cli hands a real id that stays
+# stable for the whole session, so every hook call just reads it fresh.
+ai_memory_kiro_session_id_qs() {
+    payload="$1"
+    sid=$(ai_memory_extract_session_id "$payload")
+    [ -z "$sid" ] && sid="${KIRO_SESSION_ID:-}"
+    [ -n "$sid" ] && printf '&session_id=%s' "$(ai_memory_url_encode "$sid")"
+}
+
 # Antigravity's PreInvocation hook fires before every model call. Only the
 # documented invocationNum=0 boundary represents the startup event that
 # ai-memory maps to SessionStart. Missing or malformed counters fail closed so

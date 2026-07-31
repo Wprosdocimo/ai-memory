@@ -38,7 +38,7 @@ use crate::cli::{AgentChoice, SetupAgentArgs};
 use crate::commands::install_mcp;
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, CURSOR_PROFILE,
-    GEMINI_PROFILE, KIMI_CODE_EVENTS, build_claude_code_payload, build_devin_payload,
+    GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_PROFILE, build_claude_code_payload, build_devin_payload,
     build_grok_payload, hook_script_for_current_platform,
 };
 use crate::config::{Config, DEFAULT_SERVER_URL};
@@ -149,6 +149,7 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         // script listing is deduplicated below; apply-mode owns the exact
         // `[[hooks]]` TOML merge into the user's config.toml.
         AgentChoice::KimiCode => emit_other(&emit_root, agent_sub, &args, &[&KIMI_CODE_EVENTS]),
+        AgentChoice::Kiro => emit_other(&emit_root, agent_sub, &args, &[KIRO_PROFILE.events]),
         AgentChoice::OpenCode
         | AgentChoice::Pi
         | AgentChoice::Omp

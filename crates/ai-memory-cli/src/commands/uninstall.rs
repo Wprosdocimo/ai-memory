@@ -128,6 +128,20 @@ fn push_generated_delete(plan: &mut Vec<PlannedChange>, path: PathBuf, kind: Del
     }
 }
 
+/// Every `McpClient` the MCP-removal pass scans, except `Pi` — Pi bridges
+/// MCP through a generated extension, not a native mcp.json this uninstaller
+/// (or `install-mcp`) can scrape. Derived from `ValueEnum::value_variants()`
+/// rather than a hand-maintained list so a newly added client can never
+/// silently go unscanned — `Kiro` briefly did exactly that (present
+/// everywhere else, missing only from this loop) until a test caught it.
+fn mcp_clients_to_scan() -> Vec<McpClient> {
+    <McpClient as clap::ValueEnum>::value_variants()
+        .iter()
+        .copied()
+        .filter(|client| !matches!(client, McpClient::Pi))
+        .collect()
+}
+
 /// Build the full removal plan by reading each existing config file and
 /// running the matching pure stripper. Missing files / no-matches
 /// produce no entry. `name`/`url` identify the MCP server.
@@ -268,23 +282,7 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
     // ---- MCP (per client) ----
     if want(crate::cli::UninstallOnly::Mcp) {
         use crate::cli::McpClient::*;
-        for client in [
-            ClaudeCode,
-            Codex,
-            Grok,
-            OpenCode,
-            Cursor,
-            ClaudeDesktop,
-            GeminiCli,
-            Openclaw,
-            Omp,
-            AntigravityCli,
-            Zero,
-            VsCodeCopilot,
-            Zed,
-            Devin,
-            KimiCode,
-        ] {
+        for client in mcp_clients_to_scan() {
             let paths = if matches!(client, ClaudeCode) {
                 claude_config_paths(
                     home.as_deref(),
@@ -938,7 +936,8 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::Omp
         | McpClient::AntigravityCli
         | McpClient::KimiCode
-        | McpClient::Devin => Some(&["mcpServers"]),
+        | McpClient::Devin
+        | McpClient::Kiro => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::Openclaw | McpClient::Zero => Some(&["mcp", "servers"]),
         McpClient::VsCodeCopilot => Some(&["servers"]),
@@ -1986,6 +1985,51 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["mcpServers"].get("ai-memory").is_none());
         assert!(v["mcpServers"].get("other").is_some());
+    }
+
+    #[test]
+    fn strip_mcp_kiro_root_servers() {
+        // Kiro's entry is direct HTTP (`{"url": ..., "headers": {...}}`,
+        // verified live against kiro-cli 2.16.0 — no stdio shim, unlike
+        // Claude Desktop) so it strips the same generic way as KimiCode's
+        // root `mcpServers` entries.
+        let content = r#"{"mcpServers":{"ai-memory":{"url":"http://127.0.0.1:49374/mcp","headers":{"Authorization":"Bearer t"}},"other":{"url":"http://x"}}}"#;
+        let (out, removed) = strip_mcp_json(
+            content,
+            McpClient::Kiro,
+            Some("ai-memory"),
+            "http://127.0.0.1:49374/mcp",
+        )
+        .unwrap();
+        assert_eq!(removed, vec!["ai-memory".to_string()]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["mcpServers"].get("ai-memory").is_none());
+        assert!(v["mcpServers"].get("other").is_some());
+    }
+
+    /// Regression: `Kiro` was fully wired everywhere else (render, apply,
+    /// strip, infer) but briefly missing from the uninstall discovery loop
+    /// itself, so `ai-memory uninstall` silently never found its mcp.json
+    /// entry. `mcp_clients_to_scan()` is derived from `value_variants()`
+    /// specifically so a future addition can't repeat this — this test
+    /// guards the one deliberate exclusion (`Pi`) stays exactly one.
+    #[test]
+    fn mcp_clients_to_scan_covers_every_scrapeable_client() {
+        let scanned = mcp_clients_to_scan();
+        assert!(
+            scanned.contains(&McpClient::Kiro),
+            "Kiro must be scanned during uninstall — it has a discoverable default mcp.json"
+        );
+        let all = <McpClient as clap::ValueEnum>::value_variants();
+        assert_eq!(
+            scanned.len(),
+            all.len() - 1,
+            "exactly one client (Pi) should be excluded from the scan list"
+        );
+        assert!(
+            !scanned.contains(&McpClient::Pi),
+            "Pi has no native mcp.json to scrape and must stay excluded"
+        );
     }
 
     #[test]

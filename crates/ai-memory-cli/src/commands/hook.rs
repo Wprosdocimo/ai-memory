@@ -254,18 +254,46 @@ fn session_id_query_suffix(
     event: &str,
     raw: &serde_json::Value,
 ) -> String {
+    session_id_query_suffix_with(data_dir, agent, event, raw, env_lookup)
+}
+
+/// Devin's payload never carries a session id at all, so a synthetic one is
+/// minted on session-start and persisted to disk for the rest of that
+/// session's hooks to pick back up (`stored_session_id`/`fresh_session_id`).
+///
+/// Kiro's payload also never carries a session id, but unlike Devin it
+/// doesn't need synthesis or persistence — kiro-cli hands the real id via
+/// `KIRO_SESSION_ID`, stable for the whole process/session lifetime, so
+/// every hook call reads it fresh from the environment. This is the query
+/// string counterpart to `hook_context`'s same env fallback: `hook_context`
+/// covers the handoff GET and MetadataOnly body, this covers the main POST.
+fn session_id_query_suffix_with(
+    data_dir: &Path,
+    agent: &str,
+    event: &str,
+    raw: &serde_json::Value,
+    mut env_lookup: impl FnMut(&str) -> Option<String>,
+) -> String {
     let agent_kind = AgentKind::from_wire(agent);
-    if agent_kind != AgentKind::Devin || payload_has_session_id(raw) {
+    if payload_has_session_id(raw) {
         return String::new();
     }
-
-    let session_id = if event == "session-start" {
-        fresh_session_id(data_dir, agent_kind)
-    } else {
-        stored_session_id(data_dir, agent_kind)
-            .unwrap_or_else(|| fresh_session_id(data_dir, agent_kind))
-    };
-    format!("&session_id={}", url_encode(&session_id))
+    match agent_kind {
+        AgentKind::Devin => {
+            let session_id = if event == "session-start" {
+                fresh_session_id(data_dir, agent_kind)
+            } else {
+                stored_session_id(data_dir, agent_kind)
+                    .unwrap_or_else(|| fresh_session_id(data_dir, agent_kind))
+            };
+            format!("&session_id={}", url_encode(&session_id))
+        }
+        AgentKind::Kiro => env_lookup("KIRO_SESSION_ID")
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| format!("&session_id={}", url_encode(&id)))
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
 }
 
 fn resolve_hook_cwd_with(
@@ -720,11 +748,33 @@ fn parse_hook_payload(mut payload: String) -> serde_json::Result<(String, serde_
 }
 
 fn hook_context(agent: &str, raw: &serde_json::Value) -> (Option<String>, Option<String>) {
+    hook_context_with(agent, raw, env_lookup)
+}
+
+fn hook_context_with(
+    agent: &str,
+    raw: &serde_json::Value,
+    mut env_lookup: impl FnMut(&str) -> Option<String>,
+) -> (Option<String>, Option<String>) {
     let (cwd, session_id) = canonical_context(raw);
+    let agent_kind = AgentKind::from_wire(agent);
+    // Kiro's hook STDIN payload omits `session_id` in every event (a gap
+    // versus Kiro's own docs, verified live against kiro-cli 2.15.2) — the
+    // real id is only available via the `KIRO_SESSION_ID` env var the
+    // process is launched with. `cwd` IS present in Kiro's payload, so this
+    // must not live inside the `cwd.is_none()` branch below (that branch
+    // only ever runs for agents whose payload omits cwd too, e.g. Devin).
+    let session_id = session_id.or_else(|| {
+        if agent_kind == AgentKind::Kiro {
+            env_lookup("KIRO_SESSION_ID")
+        } else {
+            None
+        }
+    });
     if cwd.is_some() {
         return (cwd, session_id);
     }
-    if AgentKind::from_wire(agent) == AgentKind::Devin {
+    if agent_kind == AgentKind::Devin {
         (
             resolve_cwd_with_fallbacks(raw, env_lookup, || std::env::current_dir().ok()),
             session_id,
@@ -982,6 +1032,64 @@ mod tests {
         );
     }
 
+    // ── Kiro CLI ──
+
+    #[test]
+    fn kiro_session_id_falls_back_to_env_when_payload_omits_it() {
+        // Real kiro-cli 2.15.2 payload shape: cwd is present, session_id never is.
+        let raw = serde_json::json!({
+            "hook_event_name": "agentSpawn",
+            "cwd": "/home/alice/project",
+        });
+        let (cwd, session_id) = hook_context_with("kiro", &raw, |name| {
+            (name == "KIRO_SESSION_ID").then(|| "abc-123".to_string())
+        });
+        assert_eq!(cwd.as_deref(), Some("/home/alice/project"));
+        assert_eq!(session_id.as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn kiro_session_id_is_none_when_env_var_absent() {
+        let raw = serde_json::json!({
+            "hook_event_name": "agentSpawn",
+            "cwd": "/home/alice/project",
+        });
+        let (cwd, session_id) = hook_context_with("kiro", &raw, |_| None);
+        assert_eq!(cwd.as_deref(), Some("/home/alice/project"));
+        assert_eq!(session_id, None);
+    }
+
+    #[test]
+    fn kiro_payload_session_id_wins_over_env_when_both_present() {
+        // Never observed live, but the payload should still take precedence
+        // over the env fallback if some future kiro-cli version starts
+        // sending it.
+        let raw = serde_json::json!({
+            "hook_event_name": "agentSpawn",
+            "cwd": "/home/alice/project",
+            "session_id": "from-payload",
+        });
+        let (_, session_id) = hook_context_with("kiro", &raw, |name| {
+            (name == "KIRO_SESSION_ID").then(|| "from-env".to_string())
+        });
+        assert_eq!(session_id.as_deref(), Some("from-payload"));
+    }
+
+    #[test]
+    fn non_kiro_agents_do_not_consult_kiro_session_id_env() {
+        // A KIRO_SESSION_ID set in the environment (e.g. a stray leftover from
+        // a nested kiro-cli invocation) must never leak into another agent's
+        // session id.
+        let raw = serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "cwd": "/home/alice/project",
+        });
+        let (_, session_id) = hook_context_with("claude-code", &raw, |name| {
+            (name == "KIRO_SESSION_ID").then(|| "should-not-leak".to_string())
+        });
+        assert_eq!(session_id, None);
+    }
+
     #[tokio::test]
     async fn devin_session_start_real_fixture_without_session_id_or_cwd_is_accepted() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1120,7 +1228,7 @@ mod tests {
     }
 
     #[test]
-    fn session_id_query_suffix_is_devin_only() {
+    fn session_id_query_suffix_is_devin_and_kiro_only() {
         let tmp = tempfile::tempdir().unwrap();
         let raw = serde_json::json!({"hook_event_name": "PostToolUse"});
 
@@ -1128,6 +1236,54 @@ mod tests {
 
         assert!(suffix.is_empty());
         assert!(stored_session_id(tmp.path(), AgentKind::ClaudeCode).is_none());
+    }
+
+    #[test]
+    fn kiro_query_session_id_comes_from_env_on_every_call() {
+        // Unlike Devin, Kiro's id is never synthesized/persisted — it's read
+        // fresh from KIRO_SESSION_ID each time, matching what hooks/kiro/*.sh
+        // does directly in shell.
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = serde_json::json!({"hook_event_name": "PostToolUse", "cwd": "/repo"});
+
+        let suffix =
+            session_id_query_suffix_with(tmp.path(), "kiro", "post-tool-use", &raw, |name| {
+                (name == "KIRO_SESSION_ID").then(|| "kiro-abc".to_string())
+            });
+
+        assert_eq!(suffix, "&session_id=kiro-abc");
+        // No disk persistence needed — nothing gets written for Kiro.
+        assert!(stored_session_id(tmp.path(), AgentKind::Kiro).is_none());
+    }
+
+    #[test]
+    fn kiro_query_session_id_empty_without_env_var() {
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = serde_json::json!({"hook_event_name": "PostToolUse", "cwd": "/repo"});
+
+        let suffix =
+            session_id_query_suffix_with(tmp.path(), "kiro", "post-tool-use", &raw, |_| None);
+
+        assert!(suffix.is_empty());
+    }
+
+    #[test]
+    fn kiro_query_session_id_does_not_override_native_payload_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let with_session = serde_json::json!({
+            "session_id": "native-session",
+            "hook_event_name": "PostToolUse"
+        });
+
+        let suffix = session_id_query_suffix_with(
+            tmp.path(),
+            "kiro",
+            "post-tool-use",
+            &with_session,
+            |name| (name == "KIRO_SESSION_ID").then(|| "kiro-abc".to_string()),
+        );
+
+        assert!(suffix.is_empty());
     }
 
     #[test]

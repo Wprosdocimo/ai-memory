@@ -111,7 +111,7 @@ metadata.
 > **One-shot tip:** every snippet below is also reachable from the
 > CLI:
 > ```bash
-> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / devin / zero / vscode-copilot / zed
+> ai-memory install-mcp --client gemini-cli   # or cursor / claude-desktop / openclaw / omp / pi / antigravity-cli / grok / kimi-code / kiro / devin / zero / vscode-copilot / zed
 > ```
 
 ---
@@ -782,6 +782,79 @@ same pattern as Gemini CLI.
   but are mutually exclusive event triggers, so successful and failed calls
   are both captured once.
 
+## Kiro CLI
+
+**Status:** ✅ MCP supported. ✅ Lifecycle hooks supported via
+`ai-memory install-hooks --agent kiro --apply`.
+
+**Config file (MCP):** `~/.kiro/settings/mcp.json` (project-scoped
+`.kiro/settings/mcp.json` takes precedence inside kiro-cli itself).
+
+Kiro accepts a direct HTTP `mcpServers` entry — verified live against
+`kiro-cli mcp add --url <url>` (kiro-cli 2.16.0), which writes a bare
+`{"url": ...}` entry with no `command`/`args`/`type`:
+
+```bash
+ai-memory install-mcp --client kiro --apply \
+    --server-url "http://homelab:49374/mcp" --auth-token "$TOKEN"
+```
+
+which merges:
+
+```json
+{
+  "mcpServers": {
+    "ai-memory": {
+      "url": "http://homelab:49374/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+**Config file (hooks):** a per-agent JSON — `.kiro/agents/<name>.json`
+(project) or `~/.kiro/agents/<name>.json` (global) — not one fixed settings
+file. Kiro's three built-in agents (`kiro_default`, `kiro_help`,
+`kiro_planner`) are compiled in, not files, so there is no default to fall
+back to:
+
+```bash
+# Create the agent first if it doesn't exist yet.
+kiro-cli agent create my-agent
+
+ai-memory install-hooks --agent kiro --apply \
+    --config-file ~/.kiro/agents/my-agent.json \
+    --server-url "http://homelab:49374" --auth-token "$TOKEN"
+```
+
+`install-hooks` merges only the `hooks` key, preserving `name`,
+`description`, `prompt`, `mcpServers`, `tools`, and everything else the agent
+JSON already holds. The installed entries cover `agentSpawn`,
+`userPromptSubmit`, `preToolUse`, `postToolUse`, and `stop` — no `SessionEnd`
+equivalent, the same gap Codex has. Capture is fire-and-forget; a pending
+handoff is injected at `agentSpawn` — the closest analog to `SessionStart`,
+and confirmed live to inject hook stdout into context — through the hook's
+stdout.
+
+**Gotchas:**
+- Kiro's hook STDIN payload never carries `session_id`, contradicting
+  kiro-cli's own documentation (verified live against kiro-cli 2.15.2 and
+  2.16.0). The real id is only available via the `KIRO_SESSION_ID`
+  environment variable; ai-memory reads it there instead, on every hook
+  call.
+- Kiro's hook handler shape is flatter than every other supported agent: no
+  `type` field, no top-level `version` key. `preToolUse`/`postToolUse` carry
+  a wildcard `matcher`; every other event omits it entirely, matching
+  kiro-cli's own documented examples.
+- `ai-memory uninstall` removes the MCP entry from the default
+  `~/.kiro/settings/mcp.json`, but because hooks live in an arbitrary
+  `--config-file` rather than a fixed default path, it cannot discover or
+  clean them up — remove the `hooks` key from that agent JSON by hand.
+- No automatic true session-end signal (`stop` is a turn boundary, not a
+  session boundary) — run `ai-memory finalize-session --agent kiro` when you
+  need a final summary/handoff, the same pattern as Codex and Antigravity
+  CLI.
+
 ## OpenClaw
 
 **Status:** ✅ MCP supported. ✅ Lifecycle hooks supported via a native
@@ -944,8 +1017,8 @@ that *starts* the next one - to play nicely with ai-memory:
 
 | Side | What's needed | Covered by |
 |---|---|---|
-| **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, and OMP. Codex and Antigravity CLI have no reliable true session-end event: run `ai-memory finalize-session` for Codex or `ai-memory finalize-session --agent antigravity-cli` for Antigravity after the final turn. |
-| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / OpenClaw / OpenCode / OMP. It requires a client that consumes startup-hook stdout or an equivalent context-injection result. Grok and Zero are explicitly excluded because they discard SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
+| **Ending side** | The agent must create a handoff through a true session-end hook, the manual finalizer, or `memory_handoff_begin`. | Built-in automatically for Claude Code, Devin CLI, Cursor, Gemini CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, OpenCode, and OMP. Codex, Antigravity CLI, and Kiro CLI have no reliable true session-end event: run `ai-memory finalize-session` for Codex, `ai-memory finalize-session --agent antigravity-cli` for Antigravity, or `ai-memory finalize-session --agent kiro` for Kiro after the final turn. |
+| **Starting side** | Either (a) the session-start/plugin path injects the handoff via `/handoff`, OR (b) the model proactively calls `memory_handoff_accept` on first turn. | (a) is built-in for Claude Code / Codex / Devin CLI / Cursor / Gemini CLI / Antigravity CLI / Kimi Code / Kiro CLI / OpenClaw / OpenCode / OMP. It requires a client that consumes startup-hook stdout or an equivalent context-injection result. Grok and Zero are explicitly excluded because they discard SessionStart stdout; use (b). (b) works for any MCP-capable client if you nudge the model - see [the managed routing package](usage.md#install-the-routing-snippet-and-agent-skills). |
 
 OpenCode uses its official `session.deleted` plugin event for true session-end
 delivery. Its generated plugin also sends a deduped best-effort close for any

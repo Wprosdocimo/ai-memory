@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Amazon Kiro CLI (`kiro-cli`) is now a supported MCP + lifecycle-hook
+  integration (`--client kiro` / `--agent kiro`, alias `kiro-cli`).
+  `install-mcp` merges a direct-HTTP `mcpServers` entry (`url` + optional
+  bearer `headers`, no stdio shim) into `~/.kiro/settings/mcp.json`
+  (project-scoped `.kiro/settings/mcp.json` takes precedence inside
+  kiro-cli). `install-hooks` merges a `hooks` key into the Kiro agent
+  config `--config-file` points at — Kiro has no file-backed default
+  agent (its three built-ins are compiled in), so `--config-file` is
+  required and the target file must already exist (`kiro-cli agent
+  create <name>`). Hooks cover `agentSpawn`, `userPromptSubmit`,
+  `preToolUse`, `postToolUse`, and `stop` (no `SessionEnd` equivalent,
+  same gap as Codex); `preToolUse`/`postToolUse` carry a wildcard
+  `matcher`, every other event omits it, matching Kiro's flatter handler
+  shape (no `type` field, no top-level `version`). Kiro's hook STDIN
+  payload never carries `session_id` — the real id is read from the
+  `KIRO_SESSION_ID` environment variable instead, both in the native
+  `ai-memory hook` command and in the vendored `hooks/kiro/*.sh` /
+  `*.ps1` scripts. Handoffs inject through `agentSpawn` hook stdout,
+  which kiro-cli prepends to the resuming session's context;
+  `setup-agent` handles the new agent like the other first-class
+  integrations. `uninstall` removes the MCP entry from the default
+  `~/.kiro/settings/mcp.json` but cannot discover hooks installed
+  against a custom `--config-file` — remove the `hooks` key from that
+  file manually.
+- The store migration set now admits `kiro` as a persisted
+  `sessions.agent_kind`, preserving the same workspace/project
+  invariants as the other supported agents.
+
 ## [1.21.0] - 2026-07-31
 
 ### Added

@@ -221,6 +221,14 @@ function Get-AiMemorySessionIdQuery {
     if ($env:AI_MEMORY_SESSION_ID) {
         return "&session_id=$([uri]::EscapeDataString($env:AI_MEMORY_SESSION_ID))"
     }
+    # Kiro's hook STDIN payload omits session_id in every event (a gap
+    # versus Kiro's own docs, verified live against kiro-cli 2.15.2) — the
+    # real id is only available via $env:KIRO_SESSION_ID. Prefer it over
+    # the synthetic per-PID id below, same as the DEVIN_PROJECT_DIR cwd
+    # fallback a few functions up.
+    if ($Agent -eq "kiro" -and $env:KIRO_SESSION_ID) {
+        return "&session_id=$([uri]::EscapeDataString($env:KIRO_SESSION_ID))"
+    }
 
     $Path = Get-AiMemorySessionIdPath -Agent $Agent
     $SessionId = $null

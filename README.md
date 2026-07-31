@@ -38,6 +38,7 @@
 | Grok Build CLI | Supported | MCP config (`install-mcp --client grok` → `$GROK_HOME/config.toml`, default `~/.grok/config.toml`) + lifecycle hooks (`install-hooks --agent grok` → `$GROK_HOME/hooks/ai-memory.json`, default `~/.grok/hooks/ai-memory.json`, Grok-specific hook bundle). Capture works; no hook handoff injection — Grok ignores `SessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. `ai-memory run grok` adds managed workstream resume with the context packet delivered natively through `--rules`. Skills root: `.grok/skills` / `$GROK_HOME/skills` (default `~/.grok/skills`). |
 | Zero | Supported | `install-mcp --client zero` (native HTTP + bearer in `~/.config/zero/config.json`) + lifecycle hooks via `install-hooks --agent zero --apply` (exec-form native commands in `~/.config/zero/hooks.json`, JSON payload on stdin, no shell). Capture works incl. specialist (subagent) events; no handoff injection — Zero discards `sessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. |
 | Kimi Code | Supported | MCP config (`url` entry in `~/.kimi-code/mcp.json`) + lifecycle hooks (`[[hooks]]` in `~/.kimi-code/config.toml`, 10 events including subagent start/stop and `PostToolUseFailure` for tool-failure capture); both paths honor `$KIMI_CODE_HOME`. Handoffs inject via `UserPromptSubmit` stdout (Kimi Code discards `SessionStart` hook stdout); `ai-memory run kimi` adds managed workstream resume. |
+| Kiro CLI | Supported | MCP config (`install-mcp --client kiro`, direct HTTP `url` entry in `~/.kiro/settings/mcp.json`; project-scoped `.kiro/settings/mcp.json` takes precedence inside kiro-cli) + lifecycle hooks (`install-hooks --agent kiro`, alias `kiro-cli`). Kiro has no file-backed default agent (its three built-ins are compiled in), so hooks require an explicit `--config-file` pointing at an agent JSON created with `kiro-cli agent create <name>`; only the `hooks` key is merged in. Covers `agentSpawn`, `userPromptSubmit`, `preToolUse`, `postToolUse`, and `stop` (no `SessionEnd` equivalent, same gap as Codex). Kiro's hook payload never carries `session_id` — the real id is read from the `KIRO_SESSION_ID` environment variable instead. Handoffs inject via `agentSpawn` hook stdout. `uninstall` removes the MCP entry but cannot discover hooks installed against a custom `--config-file`. |
 | VS Code Copilot | MCP-only | `.vscode/mcp.json` for Copilot agent mode; no lifecycle hooks (Copilot does not expose them yet). |
 | Zed | MCP-only | Native remote MCP under `context_servers` in Zed's user `settings.json`; no lifecycle hooks or managed-workstream support. |
 | Hermes Agent | Community | A community-maintained [`ai-memory-hermes-plugin`](https://github.com/MrLuciano/ai-memory-hermes-plugin) is available. It is not part of ai-memory's first-party install surface; review its compatibility matrix, install/uninstall scripts, and secret handling before using it. |
@@ -132,10 +133,10 @@ priors are at the [bottom](#influences-and-prior-art).
   mode. Mounted on the same axum server as MCP.
 - **Multi-agent + multi-machine ready.** Supported clients: Claude
   Code, Codex, Devin CLI, OpenCode, Cursor, Claude Desktop (via `mcp-remote`),
-  Gemini CLI, Antigravity CLI, Grok Build CLI, Kimi Code, OpenClaw, Oh My Pi
-  / OMP (`omp` / `oh-my-pi`), Pi via generated bridge extension, VS Code
-  GitHub Copilot agent mode (MCP-only, workspace `.vscode/mcp.json`), and Zed
-  (MCP-only, user `settings.json`).
+  Gemini CLI, Antigravity CLI, Grok Build CLI, Kimi Code, Kiro CLI, OpenClaw,
+  Oh My Pi / OMP (`omp` / `oh-my-pi`), Pi via generated bridge extension, VS
+  Code GitHub Copilot agent mode (MCP-only, workspace `.vscode/mcp.json`), and
+  Zed (MCP-only, user `settings.json`).
   Server runs local (loopback) OR on a homelab box (LAN/VPN/cloud)
   with bearer-token auth. Shared servers can opt into
   [`[auto_scope]` modes](docs/auto-scope.md) for per-user or

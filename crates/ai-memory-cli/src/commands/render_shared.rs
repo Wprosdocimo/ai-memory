@@ -499,6 +499,15 @@ pub(crate) enum HookShape {
     /// `hooks.json` also requires a sibling `version: 1` key at
     /// the top level — handled by the caller's apply path.
     Flat,
+    /// Kiro CLI (per <https://kiro.dev/docs/cli/custom-agents/configuration-reference/>,
+    /// verified against kiro-cli 2.15.2): `"e": [ { "command":"..." } ]` —
+    /// even flatter than Cursor. No `type` field, no top-level `version`
+    /// key, and `matcher` is only meaningful (and only emitted here) for
+    /// the two tool-scoped events, `preToolUse`/`postToolUse` — Kiro
+    /// silently ignores an absent matcher on those (defaults to
+    /// match-all) but the upstream doc's own examples omit it on
+    /// non-tool events, so we do too rather than guess at tolerance.
+    Bare,
 }
 
 /// One hook profile = (event vocabulary, JSON shape). Each agent
@@ -576,6 +585,26 @@ pub(crate) const GEMINI_PROFILE: HookProfile = HookProfile {
     events: &GEMINI_EVENTS,
     shape: HookShape::Nested,
 };
+pub(crate) const KIRO_PROFILE: HookProfile = HookProfile {
+    events: &KIRO_EVENTS,
+    shape: HookShape::Bare,
+};
+
+/// Kiro CLI's hook-event vocabulary (per
+/// <https://kiro.dev/docs/cli/hooks/>, verified against kiro-cli 2.15.2).
+/// Same five events Claude Code covers minus `SessionEnd` — Kiro has no
+/// session-end signal, only `stop` (turn end), the same gap Codex has.
+/// `agentSpawn` is the closest analog to `SessionStart` and DOES inject
+/// hook stdout into context (confirmed live), so `AgentKind::Kiro` is
+/// intentionally left out of `session_start_injects_handoff`'s exclusion
+/// list in `ai-memory-core`.
+pub(crate) const KIRO_EVENTS: [(&str, &str); 5] = [
+    ("agentSpawn", "session-start.sh"),
+    ("userPromptSubmit", "user-prompt-submit.sh"),
+    ("preToolUse", "pre-tool-use.sh"),
+    ("postToolUse", "post-tool-use.sh"),
+    ("stop", "stop.sh"),
+];
 
 /// Antigravity CLI (`agy`) hook-event vocabulary (per
 /// <https://antigravity.google/docs/hooks>). Named-groups format
@@ -975,9 +1004,12 @@ fn build_hook_payload_for_platform(
         //      `hooks/claude-code/session-start.sh` etc.), so no
         //      script changes are required on POSIX. Windows uses an
         //      explicit PowerShell command with equivalent env setup.
-        let handler = hook_handler_value(hook_handler_spec(
-            &abs, server_url, auth_token, context, shape,
-        ));
+        let spec = hook_handler_spec(&abs, server_url, auth_token, context, shape);
+        let handler = if shape == HookShape::Bare {
+            bare_hook_handler_value(spec)
+        } else {
+            hook_handler_value(spec)
+        };
 
         // Empty matcher = fire on every event of this kind. Right
         // for ai-memory's capture hooks (every prompt, every tool
@@ -987,7 +1019,14 @@ fn build_hook_payload_for_platform(
                 "matcher": "",
                 "hooks": [handler],
             }]),
-            HookShape::Flat => Value::Array(vec![hook_handler_with_matcher(handler)]),
+            HookShape::Flat => Value::Array(vec![hook_handler_with_matcher(handler, "")]),
+            HookShape::Bare => {
+                Value::Array(vec![if matches!(*event, "preToolUse" | "postToolUse") {
+                    hook_handler_with_matcher(handler, "*")
+                } else {
+                    handler
+                }])
+            }
         };
         hooks_block.insert((*event).to_string(), entry);
     }
@@ -1016,6 +1055,18 @@ fn hook_handler_spec(
     HookHandlerSpec::ShellString(hook_command(script, server_url, auth_token, context))
 }
 
+/// Kiro's handler object: just `command`, no `type` field (unlike every
+/// other agent's shape). The `Exec` variant never applies to Kiro today
+/// (only Claude Code on native Windows sets `claude_windows_exec_allowed`),
+/// but it's handled for completeness — `args` has no home in Kiro's shape,
+/// so it would need folding into `command` if that ever changes.
+fn bare_hook_handler_value(spec: HookHandlerSpec) -> Value {
+    match spec {
+        HookHandlerSpec::ShellString(command) => json!({ "command": command }),
+        HookHandlerSpec::Exec { command, .. } => json!({ "command": command }),
+    }
+}
+
 fn hook_handler_value(spec: HookHandlerSpec) -> Value {
     match spec {
         HookHandlerSpec::ShellString(command) => json!({
@@ -1030,9 +1081,9 @@ fn hook_handler_value(spec: HookHandlerSpec) -> Value {
     }
 }
 
-fn hook_handler_with_matcher(mut handler: Value) -> Value {
+fn hook_handler_with_matcher(mut handler: Value, matcher: &str) -> Value {
     if let Some(obj) = handler.as_object_mut() {
-        obj.insert("matcher".to_string(), Value::String(String::new()));
+        obj.insert("matcher".to_string(), Value::String(matcher.to_string()));
     }
     handler
 }
@@ -2052,7 +2103,9 @@ check(activeKeep.disposition === "keep" && activeKeep.protocol?.version === 1 &&
             );
             match shape {
                 HookShape::Nested => v.pointer("/hooks/SessionStart/0/hooks/0").unwrap().clone(),
-                HookShape::Flat => v.pointer("/hooks/SessionStart/0").unwrap().clone(),
+                HookShape::Flat | HookShape::Bare => {
+                    v.pointer("/hooks/SessionStart/0").unwrap().clone()
+                }
             }
         }
 

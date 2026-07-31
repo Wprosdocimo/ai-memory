@@ -9,7 +9,7 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, OpenClaw, VS Code Copilot, Zed)
+  (Codex, Devin CLI, OpenCode, OMP, Pi, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, Grok Build CLI, Zero, Kimi Code, Kiro CLI, OpenClaw, VS Code Copilot, Zed)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -734,6 +734,53 @@ script-fallback installation so its staged scripts are refreshed.
 Kimi Code hook entries accept only `event`, `matcher`, `command`, and
 `timeout`; extra fields make the whole `config.toml` fail to load, so prefer
 `install-hooks --apply` over hand edits.
+
+### Kiro CLI
+
+Kiro CLI (`kiro-cli`, Amazon) keeps MCP servers in `~/.kiro/settings/mcp.json`
+(project-scoped `.kiro/settings/mcp.json` takes precedence inside kiro-cli
+itself) and lifecycle hooks inside a per-agent JSON config —
+`.kiro/agents/<name>.json` (project) or `~/.kiro/agents/<name>.json`
+(global) — rather than one fixed settings file. The CLI also accepts
+`--agent kiro-cli` / `--client kiro-cli` as aliases.
+
+```bash
+ai-memory install-mcp --client kiro --apply \
+    --server-url "http://homelab:49374/mcp" \
+    --auth-token "$TOKEN"
+
+# Kiro has no file-backed default agent (its three built-ins — kiro_default,
+# kiro_help, kiro_planner — are compiled in, not files), so hooks require an
+# explicit --config-file pointing at an agent JSON. Create it first if it
+# doesn't exist:
+#   kiro-cli agent create my-agent
+ai-memory install-hooks --agent kiro --apply \
+    --config-file ~/.kiro/agents/my-agent.json \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+```
+
+`install-hooks` merges only the `hooks` key into the target agent JSON,
+preserving `name`, `description`, `prompt`, `mcpServers`, `tools`, and every
+other field the file already holds. Entries cover `agentSpawn`,
+`userPromptSubmit`, `preToolUse`, `postToolUse`, and `stop` — no `SessionEnd`
+equivalent, the same gap Codex has. Kiro's flatter hook shape has no `type`
+field and no top-level `version` key; `preToolUse`/`postToolUse` carry a
+wildcard `matcher`, every other event omits it entirely (matching kiro-cli's
+own documented examples).
+
+Kiro's hook STDIN payload never carries `session_id`, despite kiro-cli's own
+documentation (verified live against kiro-cli 2.15.2 and 2.16.0) — the real
+id is only available via the `KIRO_SESSION_ID` environment variable, read
+fresh on every hook call (no synthesis or persistence needed, unlike Devin).
+A pending handoff is injected at `agentSpawn` — the closest analog to
+`SessionStart` — through the hook's stdout, which kiro-cli prepends to the
+resuming session's context.
+
+Because hooks live in an arbitrary `--config-file` rather than a fixed
+default path, `ai-memory uninstall` can remove the MCP entry from the default
+`~/.kiro/settings/mcp.json` but cannot discover or clean up hooks — remove
+the `hooks` key from that agent JSON by hand if you need to fully uninstall.
 
 ### OpenCode
 

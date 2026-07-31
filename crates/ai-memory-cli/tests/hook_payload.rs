@@ -17,12 +17,30 @@ fn run_hook_event(data_dir: &Path, event: &str, payload: &[u8]) -> Output {
 }
 
 fn run_hook_full(data_dir: &Path, event: &str, payload: &[u8], capture_assistant: bool) -> Output {
+    run_hook_agent_full(
+        data_dir,
+        "claude-code",
+        event,
+        payload,
+        capture_assistant,
+        &[],
+    )
+}
+
+fn run_hook_agent_full(
+    data_dir: &Path,
+    agent: &str,
+    event: &str,
+    payload: &[u8],
+    capture_assistant: bool,
+    env: &[(&str, &str)],
+) -> Output {
     let mut args = vec![
         "hook".to_string(),
         "--event".to_string(),
         event.to_string(),
         "--agent".to_string(),
-        "claude-code".to_string(),
+        agent.to_string(),
         "--server-url".to_string(),
         "http://127.0.0.1:1".to_string(),
     ];
@@ -33,6 +51,7 @@ fn run_hook_full(data_dir: &Path, event: &str, payload: &[u8], capture_assistant
         .args(["--data-dir"])
         .arg(data_dir)
         .args(&args)
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -319,4 +338,57 @@ fn every_spooled_event_carries_a_persistent_ingest_key() {
         );
     }
     assert_ne!(keys[0], keys[1], "distinct events must mint distinct keys");
+}
+
+#[test]
+fn kiro_native_hook_threads_env_session_id_into_the_spooled_url() {
+    // kiro-cli's hook STDIN payload never carries session_id (verified live
+    // against kiro-cli 2.15.2) — the real id only exists as the
+    // KIRO_SESSION_ID env var the hook subprocess inherits from kiro-cli.
+    // This is the end-to-end regression for that path: spawn the real
+    // binary, the way kiro-cli's native (non-staged-script) hook command
+    // would, and confirm the id survives into the outgoing request URL.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"hook_event_name":"postToolUse","cwd":"/repo","tool_name":"Read"}"#;
+
+    let output = run_hook_agent_full(
+        tmp.path(),
+        "kiro",
+        "post-tool-use",
+        payload,
+        false,
+        &[("KIRO_SESSION_ID", "kiro-e2e-session")],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let entry = spooled_entry(tmp.path());
+    let url = entry["url"].as_str().expect("spooled url");
+    assert!(
+        url.contains("session_id=kiro-e2e-session"),
+        "session id from KIRO_SESSION_ID missing from spooled url: {url}"
+    );
+}
+
+#[test]
+fn kiro_native_hook_omits_session_id_without_env_var() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let payload = br#"{"hook_event_name":"postToolUse","cwd":"/repo","tool_name":"Read"}"#;
+
+    let output = run_hook_agent_full(tmp.path(), "kiro", "post-tool-use", payload, false, &[]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let entry = spooled_entry(tmp.path());
+    let url = entry["url"].as_str().expect("spooled url");
+    assert!(
+        !url.contains("session_id="),
+        "session_id should be absent without KIRO_SESSION_ID: {url}"
+    );
 }

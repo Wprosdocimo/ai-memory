@@ -956,6 +956,18 @@ pub enum AgentChoice {
     /// Kimi Code CLI (Moonshot AI).
     #[value(alias = "kimi")]
     KimiCode,
+    /// Amazon Kiro CLI (`kiro-cli`) — JSON-config hooks, but per-agent:
+    /// `.kiro/agents/<name>.json` (project) or `~/.kiro/agents/<name>.json`
+    /// (global), not one fixed settings file. Kiro has no file-backed
+    /// default agent (its three built-ins are compiled in, not files), so
+    /// `--apply` REQUIRES an explicit `--config-file` pointing at the agent
+    /// JSON to merge hooks into. Native `ai-memory hook --event` integration:
+    /// Kiro's hook STDIN payload omits `session_id` (a gap versus its own
+    /// docs, verified against kiro-cli 2.15.2) — the native hook reads
+    /// `KIRO_SESSION_ID` from the environment instead. No `SessionEnd`
+    /// equivalent (`stop` is the closest signal, same gap as Codex).
+    #[value(alias = "kiro-cli")]
+    Kiro,
 }
 
 impl AgentChoice {
@@ -981,6 +993,7 @@ impl AgentChoice {
             Self::Zero => AgentKind::Zero,
             Self::Devin => AgentKind::Devin,
             Self::KimiCode => AgentKind::KimiCode,
+            Self::Kiro => AgentKind::Kiro,
         }
     }
 
@@ -1068,6 +1081,15 @@ pub enum McpClient {
     /// Kimi Code CLI (Moonshot AI).
     #[value(alias = "kimi")]
     KimiCode,
+    /// Amazon Kiro CLI (`kiro-cli`) — `.kiro/settings/mcp.json` (project) or
+    /// `~/.kiro/settings/mcp.json` (global), `mcpServers` map. Direct HTTP
+    /// entry (`url` + optional `headers`, no `type` field), same shape as
+    /// Devin/Cursor — verified live against `kiro-cli mcp add --url`
+    /// (kiro-cli 2.16.0). Pair with `install-hooks --agent kiro
+    /// --config-file <path>` for lifecycle capture (no default config file
+    /// — see that variant's doc).
+    #[value(alias = "kiro-cli")]
+    Kiro,
     /// VS Code GitHub Copilot (agent mode) — per-workspace
     /// `.vscode/mcp.json`. Copilot's agent mode reads MCP servers
     /// from VS Code's own MCP framework (top-level `servers` key),

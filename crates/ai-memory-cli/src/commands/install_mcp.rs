@@ -75,6 +75,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         McpClient::Zero => render_zero(&args)?,
         McpClient::Devin => render_devin(&args)?,
         McpClient::KimiCode => render_kimi_code(&args)?,
+        McpClient::Kiro => render_kiro(&args)?,
         McpClient::VsCodeCopilot => render_vscode_copilot(&args)?,
         McpClient::Zed => render_zed(&args)?,
     };
@@ -178,6 +179,11 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
         // falling back to ~/.kimi-code; MCP servers live in mcp.json at
         // that root.
         McpClient::KimiCode => kimi_code_home(std::env::var_os("KIMI_CODE_HOME"))?.join("mcp.json"),
+        // Global default (per <https://kiro.dev/docs/cli/mcp/configuration/>,
+        // verified against kiro-cli 2.15.2): `~/.kiro/settings/mcp.json`.
+        // Project scope (`<repo>/.kiro/settings/mcp.json`) takes precedence
+        // inside kiro-cli itself when both exist; pass --config-file for that.
+        McpClient::Kiro => home()?.join(".kiro").join("settings").join("mcp.json"),
         // VS Code MCP is workspace-scoped by default: `.vscode/mcp.json`
         // at the current workspace root. The user-profile alternative
         // lives under VS Code's profile-specific data dir; use VS
@@ -417,7 +423,8 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::Omp
         | McpClient::AntigravityCli
         | McpClient::Devin
-        | McpClient::KimiCode => Some(JsonMcpLocation::RootMcpServers),
+        | McpClient::KimiCode
+        | McpClient::Kiro => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
         // Zero's config.json nests servers under `mcp.servers`, the same
         // shape OpenClaw uses.
@@ -618,6 +625,22 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             // field as streamable-HTTP; `transport` is only for legacy
             // SSE endpoints.
             entry.insert("url".into(), json!(moonshot_flavored_mcp_url(server_url)));
+            if let Some(b) = &bearer {
+                entry.insert("headers".into(), json!({"Authorization": b}));
+            }
+        }
+        McpClient::Kiro => {
+            // Direct HTTP, no stdio shim — verified live against `kiro-cli
+            // 2.16.0`: `kiro-cli mcp add --url <url>` writes a bare
+            // `{"url": "..."}` entry (no `type`/`command`/`args`), which
+            // disproved the earlier assumption that Kiro's documented
+            // command/args/env-only examples meant stdio-only transport.
+            // The `headers` key for bearer auth mirrors Cursor's shape
+            // (same undocumented-but-conventional field); `kiro-cli mcp
+            // add` has no `--header` flag to cross-check against, so only
+            // the URL/transport shape is confirmed — the auth header is
+            // still unverified.
+            entry.insert("url".into(), json!(server_url));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
@@ -964,6 +987,23 @@ fn render_claude_desktop(args: &InstallMcpArgs) -> Result<String> {
     ))
 }
 
+fn render_kiro(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# Kiro CLI — merge into mcp.json:\n\
+         #   - global:  ~/.kiro/settings/mcp.json\n\
+         #   - project: <repo>/.kiro/settings/mcp.json (takes precedence)\n\
+         #\n\
+         # Direct HTTP transport (no stdio shim needed) — verified live\n\
+         # against kiro-cli 2.16.0: `kiro-cli mcp add --url <url>` writes a\n\
+         # bare `{{\"url\": ...}}` entry, same shape emitted here. Equivalent\n\
+         # CLI form: kiro-cli mcp add --name ai-memory --url {url}\n\
+         # Restart `kiro-cli` after editing.\n\
+         {snippet}\n",
+        url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
 fn render_gemini_cli(args: &InstallMcpArgs) -> Result<String> {
     Ok(format!(
         "# Gemini CLI — merge into ~/.gemini/settings.json:\n\
@@ -1160,6 +1200,35 @@ mod tests {
         ));
         assert!(rendered.contains("--apply detects the installed form"));
         assert!(rendered.contains("--config-file"));
+    }
+
+    #[test]
+    fn kiro_entry_is_direct_http_with_no_stdio_shim() {
+        // Verified live against kiro-cli 2.16.0: `kiro-cli mcp add --url
+        // <url>` writes a bare `{"url": ...}` entry, no `command`/`args`/
+        // `type` — no mcp-remote shim needed, unlike Claude Desktop.
+        let entry = build_mcp_entry(&args_for(McpClient::Kiro)).unwrap();
+        assert_eq!(entry["url"], json!(DEFAULT_MCP_URL));
+        assert!(entry.get("command").is_none());
+        assert!(entry.get("args").is_none());
+        assert!(entry.get("type").is_none());
+    }
+
+    #[test]
+    fn kiro_entry_carries_bearer_header_when_token_set() {
+        let entry = build_mcp_entry(&args_with_token(McpClient::Kiro)).unwrap();
+        assert_eq!(
+            entry["headers"]["Authorization"],
+            json!("Bearer test-token-deadbeef")
+        );
+    }
+
+    #[test]
+    fn kiro_render_shows_the_equivalent_cli_command() {
+        let rendered = render_kiro(&args_for(McpClient::Kiro)).unwrap();
+        assert!(rendered.contains("kiro-cli mcp add"));
+        assert!(rendered.contains("~/.kiro/settings/mcp.json"));
+        assert!(!rendered.contains("mcp-remote"));
     }
 
     #[test]
@@ -1486,6 +1555,7 @@ mod tests {
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
+            McpClient::Kiro => render_kiro(&args).unwrap(),
         }
     }
 
@@ -1509,6 +1579,7 @@ mod tests {
             McpClient::KimiCode,
             McpClient::VsCodeCopilot,
             McpClient::Zed,
+            McpClient::Kiro,
         ] {
             let out = render_with_token(client);
             // Every client embeds the token as `Authorization:
@@ -1546,6 +1617,7 @@ mod tests {
             McpClient::KimiCode,
             McpClient::VsCodeCopilot,
             McpClient::Zed,
+            McpClient::Kiro,
         ] {
             let out = render_for_test(client);
             assert!(
@@ -1576,6 +1648,7 @@ mod tests {
             McpClient::KimiCode => render_kimi_code(&args).unwrap(),
             McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
             McpClient::Zed => render_zed(&args).unwrap(),
+            McpClient::Kiro => render_kiro(&args).unwrap(),
         }
     }
 

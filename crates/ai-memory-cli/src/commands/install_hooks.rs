@@ -26,7 +26,7 @@ use crate::commands::openclaw_plugin;
 use crate::commands::path_util::home_dir;
 use crate::commands::render_shared::{
     ANTIGRAVITY_LIFECYCLE_EVENTS, ANTIGRAVITY_TOOL_EVENTS, CODEX_PROFILE, CURSOR_PROFILE,
-    GEMINI_PROFILE, KIMI_CODE_EVENTS, build_antigravity_payload_with_data_dir,
+    GEMINI_PROFILE, KIMI_CODE_EVENTS, KIRO_PROFILE, build_antigravity_payload_with_data_dir,
     build_claude_code_payload_with_data_dir, build_devin_payload_with_data_dir,
     build_grok_payload_with_data_dir, build_profile_payload_for_agent, hook_script_for_claude_code,
     hook_script_for_current_platform, kimi_code_hook_commands, local_hook_policy_v1_supported,
@@ -291,6 +291,10 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
                 let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
                 apply_to_kimi_code_config(&hooks_dir, &server_url, auth, &config.data_dir, &args)
             }
+            AgentChoice::Kiro => {
+                let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+                apply_to_kiro_settings(&hooks_dir, &server_url, auth, &config.data_dir, &args)
+            }
         };
     }
     let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
@@ -375,6 +379,17 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
             let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
             render_kimi_code(&hooks_dir, &server_url, auth, &config.data_dir, strategy)
         }
+        AgentChoice::Kiro => {
+            let hooks_dir = resolve_hooks_dir(args.hooks_dir.as_deref(), args.agent)?;
+            render_agent(
+                "kiro",
+                &hooks_dir,
+                &server_url,
+                auth,
+                strategy,
+                &[KIRO_PROFILE.events],
+            )
+        }
     }
 }
 
@@ -422,6 +437,10 @@ fn existing_agent_config(args: &InstallHooksArgs) -> Option<String> {
             AgentChoice::Zero => zero_hooks_path().ok()?,
             AgentChoice::Devin => devin_hooks_path().ok()?,
             AgentChoice::KimiCode => kimi_code_config_path().ok()?,
+            // Kiro has no file-backed default agent (its built-ins are
+            // compiled in, not files) — `--config-file` is required, so this
+            // branch is unreachable in practice; nothing to read otherwise.
+            AgentChoice::Kiro => return None,
         }
     };
     std::fs::read_to_string(path).ok()
@@ -681,6 +700,11 @@ fn infer_installed_mcp_config(agent: AgentChoice) -> Result<Option<InferredMcpCo
             "url",
         )),
         McpClient::ClaudeDesktop => Ok(None),
+        McpClient::Kiro => Ok(infer_json_mcp_config(
+            &content,
+            &["mcpServers", "ai-memory"],
+            "url",
+        )),
         // MCP-only client: no AgentChoice counterpart routes here.
         // Reachable only if a future install_hooks flow targets VS
         // Code Copilot directly.
@@ -743,6 +767,7 @@ fn mcp_client_for_agent(agent: AgentChoice) -> Option<McpClient> {
         AgentChoice::Grok => Some(McpClient::Grok),
         AgentChoice::Devin => Some(McpClient::Devin),
         AgentChoice::KimiCode => Some(McpClient::KimiCode),
+        AgentChoice::Kiro => Some(McpClient::Kiro),
         // Pi bridges MCP through its generated extension, not a native
         // mcp.json the installer can scrape.
         AgentChoice::Pi => None,
@@ -1223,6 +1248,113 @@ fn apply_to_devin_settings_with_staged(
             ApplyOutcome::NoOp => "already up to date",
         }
     );
+    Ok(())
+}
+
+/// Mutate the Kiro agent config `--config-file` points at so Kiro fires the
+/// ai-memory scripts on lifecycle events. Unlike every other supported
+/// agent, Kiro has no single fixed settings file: hooks live inside a
+/// per-agent JSON blob (`.kiro/agents/<name>.json` project-scoped or
+/// `~/.kiro/agents/<name>.json` global) alongside unrelated keys (`name`,
+/// `description`, `prompt`, `mcpServers`, `tools`, …) that ai-memory must
+/// not clobber, and Kiro's three built-in agents are compiled in — no
+/// default *file* exists to fall back to. So `--config-file` is required,
+/// and the file must already exist (created via `kiro-cli agent create
+/// <name>`) so this only ever adds the `hooks` key to an agent Kiro
+/// already considers valid, rather than guessing at Kiro's full schema.
+fn apply_to_kiro_settings(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let staged = stage_hook_scripts(hooks_dir, "kiro")?;
+    apply_to_kiro_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
+}
+
+#[cfg(test)]
+fn apply_to_kiro_settings_in(
+    hooks_dir: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    staging_data_local: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let staged = stage_hook_scripts_in(hooks_dir, "kiro", staging_data_local)?;
+    apply_to_kiro_settings_with_staged(&staged, server_url, auth_token, data_dir, args)
+}
+
+fn apply_to_kiro_settings_with_staged(
+    staged: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: &Path,
+    args: &InstallHooksArgs,
+) -> Result<()> {
+    let Some(path) = args.config_file.clone() else {
+        anyhow::bail!(
+            "Kiro has no file-backed default agent — its built-in agents (kiro_default, \
+             kiro_help, kiro_planner) are compiled in, not files. Pass --config-file pointing \
+             at the agent JSON to merge hooks into, e.g.\n  \
+             --config-file ~/.kiro/agents/<name>.json          (global)\n  \
+             --config-file .kiro/agents/<name>.json            (project-scoped)\n\
+             Create the agent first with `kiro-cli agent create <name>` if it doesn't exist yet."
+        );
+    };
+    if !path.exists() {
+        anyhow::bail!(
+            "Kiro agent config not found at {}. Create it first with `kiro-cli agent create \
+             <name>` so it has Kiro's full required shape, then re-run install-hooks with the \
+             same --config-file — this only adds the `hooks` key to an agent Kiro already \
+             considers valid, it does not synthesise one from scratch.",
+            path.display()
+        );
+    }
+    let command_dir = staged_command_dir(staged, "kiro");
+    let strategy = args.project_strategy.and_then(ProjectStrategyArg::baked);
+    let payload = build_profile_payload_for_agent(
+        &KIRO_PROFILE,
+        &command_dir,
+        server_url,
+        auth_token,
+        "kiro",
+        Some(data_dir),
+        strategy,
+    );
+    let our_hooks = payload
+        .get("hooks")
+        .and_then(|v| v.as_object())
+        .context("internal: build_profile_payload_for_agent didn't return a hooks object")?
+        .clone();
+    let outcome = apply_atomic(&path, |existing| {
+        mutate_json(existing, |root| {
+            let hooks = root
+                .entry("hooks")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .context("`hooks` is present in the Kiro agent config but not an object")?;
+            for (event, value) in &our_hooks {
+                overlay_event_hooks(hooks, event, value);
+            }
+            Ok(())
+        })
+    })?;
+    println!(
+        "✓ {} {} ({})",
+        outcome.verb(),
+        path.display(),
+        match outcome {
+            ApplyOutcome::Created => "new file",
+            ApplyOutcome::Updated => "backup written next to it",
+            ApplyOutcome::NoOp => "already up to date",
+        }
+    );
+    println!();
+    println!("Kiro hooks are per-agent — make sure kiro-cli actually loads this one:");
+    println!("  → `kiro-cli chat --agent <name>` for one session, or");
+    println!("  → `kiro-cli agent set-default <name>` to make it the default.");
     Ok(())
 }
 
@@ -6336,6 +6468,197 @@ command = "AI_MEMORY_HOOK_URL=http://old:1 /old/ai-memory/hooks/kimi-code/sessio
         assert!(
             script_content.contains("else\n    printf '{}\\n'\nfi"),
             "Devin session-start.sh must print {{}} only when no handoff is available"
+        );
+    }
+
+    // ── Kiro CLI ──────────────────────────────────────────────────────
+
+    const KIRO_STUB_SCRIPTS: [&str; 5] = [
+        "session-start.sh",
+        "user-prompt-submit.sh",
+        "pre-tool-use.sh",
+        "post-tool-use.sh",
+        "stop.sh",
+    ];
+
+    fn kiro_hook_args(config_file: Option<PathBuf>, hooks_dir: &Path) -> InstallHooksArgs {
+        InstallHooksArgs {
+            agent: AgentChoice::Kiro,
+            hooks_dir: Some(hooks_dir.to_path_buf()),
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            auth_token: None,
+            config_file,
+            ..default_hook_args()
+        }
+    }
+
+    #[test]
+    fn kiro_apply_requires_config_file() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(hooks_tmp.path(), &KIRO_STUB_SCRIPTS);
+        let config_tmp = TempDir::new().unwrap();
+        let err = apply_to_kiro_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            config_tmp.path(),
+            &kiro_hook_args(None, hooks_tmp.path()),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--config-file"),
+            "error must tell the user to pass --config-file, got: {err}"
+        );
+    }
+
+    #[test]
+    fn kiro_apply_requires_existing_config_file() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(hooks_tmp.path(), &KIRO_STUB_SCRIPTS);
+        let config_tmp = TempDir::new().unwrap();
+        let missing = config_tmp.path().join("does-not-exist.json");
+        let err = apply_to_kiro_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            config_tmp.path(),
+            &kiro_hook_args(Some(missing), hooks_tmp.path()),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("kiro-cli agent create"),
+            "error must point at `kiro-cli agent create`, got: {err}"
+        );
+    }
+
+    #[test]
+    fn kiro_apply_preserves_agent_fields_and_merges_bare_hooks() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(hooks_tmp.path(), &KIRO_STUB_SCRIPTS);
+
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("playground.json");
+        // A real pre-existing agent config (mirrors kiro-cli's own
+        // `agent_config.json.example` shape) — install-hooks must only
+        // touch the `hooks` key, never clobber the rest.
+        fs::write(
+            &config_path,
+            r#"{
+                "name": "playground",
+                "description": "Senior DevOps agent",
+                "prompt": "You are Kiro.",
+                "mcpServers": {},
+                "tools": ["read", "write"],
+                "hooks": {}
+            }"#,
+        )
+        .unwrap();
+
+        apply_to_kiro_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            config_tmp.path(),
+            &kiro_hook_args(Some(config_path.clone()), hooks_tmp.path()),
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+
+        // Non-hooks agent fields survive untouched.
+        assert_eq!(parsed["name"], "playground");
+        assert_eq!(parsed["prompt"], "You are Kiro.");
+        assert_eq!(parsed["tools"], serde_json::json!(["read", "write"]));
+
+        // Every KIRO_PROFILE event is present, no SessionEnd (Kiro has none).
+        for event in [
+            "agentSpawn",
+            "userPromptSubmit",
+            "preToolUse",
+            "postToolUse",
+            "stop",
+        ] {
+            assert!(
+                parsed["hooks"][event].is_array(),
+                "hooks.{event} should be present"
+            );
+        }
+        assert!(
+            parsed["hooks"]["SessionEnd"].is_null(),
+            "Kiro has no SessionEnd equivalent — must not be written"
+        );
+
+        // Bare shape: no `type` field anywhere, unlike every other agent.
+        let agent_spawn = &parsed["hooks"]["agentSpawn"][0];
+        assert!(
+            agent_spawn.get("type").is_none(),
+            "Kiro's handler must have no `type` field, got: {agent_spawn}"
+        );
+        assert!(agent_spawn.get("command").is_some());
+
+        // matcher only on the two tool-scoped events.
+        assert!(
+            parsed["hooks"]["agentSpawn"][0].get("matcher").is_none(),
+            "agentSpawn must not carry a matcher"
+        );
+        assert!(
+            parsed["hooks"]["userPromptSubmit"][0]
+                .get("matcher")
+                .is_none(),
+            "userPromptSubmit must not carry a matcher"
+        );
+        assert!(
+            parsed["hooks"]["stop"][0].get("matcher").is_none(),
+            "stop must not carry a matcher"
+        );
+        assert_eq!(
+            parsed["hooks"]["preToolUse"][0]["matcher"], "*",
+            "preToolUse must carry a wildcard matcher"
+        );
+        assert_eq!(
+            parsed["hooks"]["postToolUse"][0]["matcher"], "*",
+            "postToolUse must carry a wildcard matcher"
+        );
+    }
+
+    #[test]
+    fn kiro_apply_reapply_is_noop() {
+        let hooks_tmp = TempDir::new().unwrap();
+        stub_scripts(hooks_tmp.path(), &KIRO_STUB_SCRIPTS);
+        let config_tmp = TempDir::new().unwrap();
+        let config_path = config_tmp.path().join("playground.json");
+        fs::write(&config_path, r#"{"name":"playground","hooks":{}}"#).unwrap();
+
+        let args = kiro_hook_args(Some(config_path.clone()), hooks_tmp.path());
+        apply_to_kiro_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            config_tmp.path(),
+            &args,
+        )
+        .unwrap();
+        let first = fs::read_to_string(&config_path).unwrap();
+
+        apply_to_kiro_settings_in(
+            hooks_tmp.path(),
+            "http://127.0.0.1:49374",
+            None,
+            config_tmp.path(),
+            config_tmp.path(),
+            &args,
+        )
+        .unwrap();
+        let second = fs::read_to_string(&config_path).unwrap();
+
+        assert_eq!(
+            first, second,
+            "re-apply with unchanged content must be a no-op"
         );
     }
 
