@@ -1026,8 +1026,16 @@ pub struct FinalizeSessionArgs {
     #[arg(long)]
     pub project: Option<String>,
     /// Finalize every matching open session instead of just the latest one.
+    /// Ignored when `--session-id` is set.
     #[arg(long)]
     pub all: bool,
+    /// Finalize exactly this session id instead of "the latest open one".
+    /// Use this when other sessions for the same agent may be open
+    /// concurrently in the same project (e.g. multiple terminal tabs each
+    /// running Kiro CLI against one repo) — picking "latest" in that case
+    /// risks closing out the wrong (still-active) session.
+    #[arg(long)]
+    pub session_id: Option<String>,
     /// Emit a JSON summary.
     #[arg(long)]
     pub json: bool,

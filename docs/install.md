@@ -782,6 +782,33 @@ default path, `ai-memory uninstall` can remove the MCP entry from the default
 `~/.kiro/settings/mcp.json` but cannot discover or clean up hooks — remove
 the `hooks` key from that agent JSON by hand if you need to fully uninstall.
 
+Kiro has no `SessionEnd` equivalent (`stop` is the closest signal, the same
+gap Codex has), so the summary page + handoff are never generated
+automatically — run a manual close after you're done with a session:
+
+```bash
+ai-memory finalize-session --agent kiro
+# add --all only to close every matching open Kiro session in this scope
+```
+
+Without `--session-id`, this closes "the newest open Kiro session" for the
+resolved workspace/project — fine for a single session at a time, but if you
+run multiple concurrent Kiro CLI sessions against the same repo (e.g. one
+per terminal tab for different tasks), that default can close the wrong
+(still-active) one instead of the one you just finished, and `--all` closes
+every open session in that scope, active ones included. Target the exact
+session instead:
+
+```bash
+ai-memory finalize-session --agent kiro --session-id <uuid>
+```
+
+`--session-id` narrows `GET /admin/open-sessions` to that one id (still
+enforcing it belongs to the resolved workspace/project/agent) instead of
+selecting by recency, so a caller that captured its own session id at spawn
+time can close exactly that session regardless of what else is open
+concurrently in the same project.
+
 ### OpenCode
 
 ```bash

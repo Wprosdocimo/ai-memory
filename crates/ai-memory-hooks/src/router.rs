@@ -5289,7 +5289,13 @@ mod tests {
         assert_eq!(
             state
                 .reader
-                .open_sessions_for_scope_agent(state.workspace_id, other, AgentKind::Codex, None)
+                .open_sessions_for_scope_agent(
+                    state.workspace_id,
+                    other,
+                    AgentKind::Codex,
+                    None,
+                    None,
+                )
                 .await
                 .unwrap()
                 .len(),
@@ -5303,6 +5309,7 @@ mod tests {
                     state.workspace_id,
                     target,
                     AgentKind::ClaudeCode,
+                    None,
                     None
                 )
                 .await

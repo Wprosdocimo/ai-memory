@@ -35,6 +35,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The store migration set now admits `kiro` as a persisted
   `sessions.agent_kind`, preserving the same workspace/project
   invariants as the other supported agents.
+- `install-mcp --client kiro` now writes the same `?flavor=moonshot`
+  marker on the MCP URL that Kimi Code already got, and `uninstall`
+  recognizes both the flavored and unflavored form when discovering
+  Kiro's entry to remove. Kiro routes through Anthropic's Messages API,
+  which rejects `memory_read_page`'s root-level `anyOf` the same way
+  Moonshot's API does (`tools.N.custom.input_schema: input_schema does
+  not support oneOf, allOf, or anyOf at the top level`) — confirmed live
+  the first time a Kiro session tried to load the tool list. The
+  `flavor=moonshot` name predates Kiro support but the schema-flattening
+  it triggers server-side isn't Moonshot-specific, so it's reused as-is.
+- `ai-memory finalize-session` accepts a new `--session-id <uuid>` flag
+  (backed by a new optional `session_id` filter on `GET
+  /admin/open-sessions`) to target one exact open session instead of
+  "the newest open one" for the agent/scope. Needed for agents with no
+  true `SessionEnd` hook (Kiro, Codex, Antigravity CLI) when multiple
+  sessions for the same agent are open concurrently in one project —
+  e.g. several terminal tabs each running Kiro CLI against the same
+  repo — where the default "newest open" selection risks closing out a
+  still-active session instead of the one that actually finished.
+  `--session-id` still enforces the given id belongs to the resolved
+  workspace/project/agent scope; it does not let a caller reach into
+  another scope's session just by knowing its id.
 
 ## [1.21.0] - 2026-07-31
 

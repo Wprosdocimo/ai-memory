@@ -1652,6 +1652,13 @@ impl ReaderPool {
     ///
     /// Results are newest-first so callers can default to finalizing only the
     /// latest open session while offering an explicit all-sessions mode.
+    /// `exact_session_id`, when set, narrows to that one session id (still
+    /// requiring it to match `workspace_id`/`project_id`/`agent_kind` and be
+    /// open) instead of applying `limit`/ordering — this is what lets a
+    /// caller that already knows its own session id (e.g. a wrapper script
+    /// that captured it at spawn time) finalize exactly that session even
+    /// when other sessions for the same agent are open concurrently in the
+    /// same project, rather than racing "the newest open one".
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -1661,28 +1668,37 @@ impl ReaderPool {
         project_id: ProjectId,
         agent_kind: AgentKind,
         limit: Option<usize>,
+        exact_session_id: Option<SessionId>,
     ) -> StoreResult<Vec<OpenSession>> {
         let agent = agent_kind.as_str().to_string();
         self.with_conn(move |conn| {
-            let limit_clause = limit.map_or(String::new(), |n| format!(" LIMIT {}", n.max(1)));
+            let (extra_clause, limit_clause) = match exact_session_id {
+                Some(_) => (" AND id = ?4", String::new()),
+                None => (
+                    "",
+                    limit.map_or(String::new(), |n| format!(" LIMIT {}", n.max(1))),
+                ),
+            };
             let sql = format!(
                 "SELECT id, cwd FROM sessions \
                  WHERE workspace_id = ?1 AND project_id = ?2 \
-                   AND agent_kind = ?3 AND ended_at IS NULL \
+                   AND agent_kind = ?3 AND ended_at IS NULL{extra_clause} \
                  ORDER BY started_at DESC, id DESC{limit_clause}"
             );
             let mut stmt = conn.prepare_cached(&sql)?;
-            let rows = stmt.query_map(
-                params![workspace_id.as_bytes(), project_id.as_bytes(), agent],
-                |row| {
-                    let id_bytes: Vec<u8> = row.get(0)?;
-                    let cwd: Option<String> = row.get(1)?;
-                    Ok((id_bytes, cwd))
-                },
-            )?;
+            let mut rows = match exact_session_id {
+                Some(sid) => stmt.query(params![
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    agent,
+                    sid.as_bytes()
+                ])?,
+                None => stmt.query(params![workspace_id.as_bytes(), project_id.as_bytes(), agent])?,
+            };
             let mut out = Vec::new();
-            for row in rows {
-                let (id_bytes, cwd) = row?;
+            while let Some(row) = rows.next()? {
+                let id_bytes: Vec<u8> = row.get(0)?;
+                let cwd: Option<String> = row.get(1)?;
                 out.push(OpenSession {
                     session_id: SessionId::from_slice(&id_bytes)?,
                     cwd,
