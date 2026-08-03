@@ -527,10 +527,15 @@ fn render_json_mcp_fragment(args: &InstallMcpArgs) -> Result<String> {
 }
 
 /// Append the `flavor=moonshot` marker to the MCP URL written into Kimi
-/// Code's mcp.json: Moonshot's API 400s root-level `anyOf`/`oneOf`/`allOf`
-/// in tool parameter schemas (issue #155's `anyOf` on `memory_read_page`),
-/// and the server answers flavored requests with flat schemas. Idempotent
-/// so re-runs never stack duplicate query pairs.
+/// Code's and Kiro CLI's mcp.json: both route through APIs (Moonshot's,
+/// and Anthropic's Messages API for Kiro) that 400 on root-level
+/// `anyOf`/`oneOf`/`allOf` in tool parameter schemas (issue #155's `anyOf`
+/// on `memory_read_page`), and the server answers flavored requests with
+/// flat schemas regardless of which client sent them. The marker name
+/// predates Kiro support but the behavior it triggers isn't
+/// Moonshot-specific, so it's reused rather than adding a second
+/// identical flag. Idempotent so re-runs never stack duplicate query
+/// pairs.
 pub(crate) fn moonshot_flavored_mcp_url(server_url: &str) -> String {
     const FLAVOR: &str = "flavor=moonshot";
     let url = server_url.trim();
@@ -640,7 +645,17 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
             // add` has no `--header` flag to cross-check against, so only
             // the URL/transport shape is confirmed — the auth header is
             // still unverified.
-            entry.insert("url".into(), json!(server_url));
+            //
+            // `moonshot_flavored_mcp_url`: Kiro routes through Anthropic's
+            // Messages API (Bedrock), which 400s on `memory_read_page`'s
+            // root-level `anyOf` the exact same way Moonshot's API does
+            // ("input_schema does not support oneOf, allOf, or anyOf at
+            // the top level") — confirmed live the first time a Kiro
+            // session tried to load the tool list. The `flavor=moonshot`
+            // marker name predates Kiro support but the strip it triggers
+            // is generic (any root combinator), so it's reused as-is
+            // rather than introducing a second identical marker.
+            entry.insert("url".into(), json!(moonshot_flavored_mcp_url(server_url)));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
@@ -988,6 +1003,7 @@ fn render_claude_desktop(args: &InstallMcpArgs) -> Result<String> {
 }
 
 fn render_kiro(args: &InstallMcpArgs) -> Result<String> {
+    let server_url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL);
     Ok(format!(
         "# Kiro CLI — merge into mcp.json:\n\
          #   - global:  ~/.kiro/settings/mcp.json\n\
@@ -996,10 +1012,13 @@ fn render_kiro(args: &InstallMcpArgs) -> Result<String> {
          # Direct HTTP transport (no stdio shim needed) — verified live\n\
          # against kiro-cli 2.16.0: `kiro-cli mcp add --url <url>` writes a\n\
          # bare `{{\"url\": ...}}` entry, same shape emitted here. Equivalent\n\
-         # CLI form: kiro-cli mcp add --name ai-memory --url {url}\n\
-         # Restart `kiro-cli` after editing.\n\
+         # CLI form: kiro-cli mcp add --name ai-memory --url {flavored_url}\n\
+         # `?flavor=moonshot`: Kiro routes through Anthropic's Messages API,\n\
+         # which rejects root-level schema combinators the same way\n\
+         # Moonshot's API does; ai-memory serves flat schemas to flavored\n\
+         # requests. Restart `kiro-cli` after editing.\n\
          {snippet}\n",
-        url = args.server_url.as_deref().unwrap_or(DEFAULT_MCP_URL),
+        flavored_url = moonshot_flavored_mcp_url(server_url),
         snippet = render_json_mcp_fragment(args)?,
     ))
 }
@@ -1208,10 +1227,25 @@ mod tests {
         // <url>` writes a bare `{"url": ...}` entry, no `command`/`args`/
         // `type` — no mcp-remote shim needed, unlike Claude Desktop.
         let entry = build_mcp_entry(&args_for(McpClient::Kiro)).unwrap();
-        assert_eq!(entry["url"], json!(DEFAULT_MCP_URL));
+        assert_eq!(entry["url"], json!(moonshot_flavored_mcp_url(DEFAULT_MCP_URL)));
         assert!(entry.get("command").is_none());
         assert!(entry.get("args").is_none());
         assert!(entry.get("type").is_none());
+    }
+
+    #[test]
+    fn kiro_entry_url_carries_moonshot_flavor_marker() {
+        // Kiro routes through Anthropic's Messages API, which 400s on
+        // memory_read_page's root-level `anyOf` the same way Moonshot's
+        // API does — confirmed live the first time a Kiro session tried
+        // to load the tool list.
+        let entry = build_mcp_entry(&args_for(McpClient::Kiro)).unwrap();
+        assert!(
+            entry["url"]
+                .as_str()
+                .unwrap()
+                .contains("flavor=moonshot")
+        );
     }
 
     #[test]

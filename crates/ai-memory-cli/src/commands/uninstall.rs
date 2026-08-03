@@ -973,12 +973,13 @@ fn mcp_entry_is_ours(key: &str, entry: &serde_json::Value, name: Option<&str>, u
 }
 
 /// URL forms uninstall matches for `client`: the endpoint as given, plus
-/// for KimiCode the `flavor=moonshot` form install-mcp actually writes
-/// (`--mcp-url` keeps the unflavored default). Every other client keeps
-/// exact-match semantics.
+/// for KimiCode and Kiro the `flavor=moonshot` form install-mcp actually
+/// writes (`--mcp-url` keeps the unflavored default). Both route through
+/// APIs that 400 on `memory_read_page`'s root-level `anyOf`. Every other
+/// client keeps exact-match semantics.
 fn mcp_url_candidates(client: McpClient, url: &str) -> Vec<String> {
     let mut candidates = vec![url.to_string()];
-    if matches!(client, McpClient::KimiCode) {
+    if matches!(client, McpClient::KimiCode | McpClient::Kiro) {
         let flavored = install_mcp::moonshot_flavored_mcp_url(url);
         if !candidates.contains(&flavored) {
             candidates.push(flavored);
@@ -2033,7 +2034,7 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
     }
 
     #[test]
-    fn mcp_url_candidates_adds_moonshot_flavor_for_kimi_code_only() {
+    fn mcp_url_candidates_adds_moonshot_flavor_for_kimi_code_and_kiro_only() {
         assert_eq!(
             mcp_url_candidates(McpClient::KimiCode, "http://127.0.0.1:49374/mcp"),
             vec![
@@ -2047,6 +2048,13 @@ command = "'/usr/local/bin/ai-memory' hook --event stop --agent kimi-code --serv
                 "http://127.0.0.1:49374/mcp?flavor=moonshot"
             ),
             vec!["http://127.0.0.1:49374/mcp?flavor=moonshot".to_string()]
+        );
+        assert_eq!(
+            mcp_url_candidates(McpClient::Kiro, "http://127.0.0.1:49374/mcp"),
+            vec![
+                "http://127.0.0.1:49374/mcp".to_string(),
+                "http://127.0.0.1:49374/mcp?flavor=moonshot".to_string()
+            ]
         );
         assert_eq!(
             mcp_url_candidates(McpClient::Cursor, "http://127.0.0.1:49374/mcp"),
