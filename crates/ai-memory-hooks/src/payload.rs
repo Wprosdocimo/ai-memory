@@ -443,6 +443,14 @@ impl HookEnvelope {
         let session_id = body_session_id.or_else(|| query.session_id.filter(|s| !s.is_empty()));
         let body_cwd = extract_string(&raw, &["cwd", "current_dir", "working_dir", "directory"])
             .or_else(|| extract_first_string_array_item(&raw, &["workspacePaths"]))
+            // Cursor CLI (`cursor-agent`, standalone, not the Cursor IDE) sends
+            // `workspace_roots` (snake_case) instead of `workspacePaths` — a
+            // real field-name mismatch, confirmed live against a v2026.09.02
+            // `cursor-agent -p` session whose hook payload carried
+            // `"workspace_roots":["/real/project/path"]` with no `cwd`/`workspacePaths`
+            // key at all, so every prior key here missed it and cwd fell through to
+            // `None`.
+            .or_else(|| extract_first_string_array_item(&raw, &["workspace_roots"]))
             .or_else(|| {
                 extract_string_path(
                     &raw,
@@ -1478,6 +1486,41 @@ mod tests {
         );
 
         assert_eq!(env.project_strategy, ProjectStrategy::RepoRoot);
+    }
+
+    /// The standalone `cursor-agent` CLI (not the Cursor IDE) reports cwd
+    /// through `workspace_roots` (snake_case array), a distinct field from
+    /// Antigravity's `workspacePaths` — confirmed live against a real
+    /// `cursor-agent -p` v2026.09.02 session, whose sessionStart/preToolUse
+    /// payloads carried this shape with no `cwd` key at all. Before this
+    /// extractor knew about `workspace_roots`, every real cursor-agent
+    /// session landed with `cwd=None`.
+    #[test]
+    fn envelope_extracts_cursor_agent_cwd_from_workspace_roots() {
+        let q = HookQuery {
+            event: "PreToolUse".into(),
+            agent: Some("cursor".into()),
+            ..Default::default()
+        };
+        let raw = serde_json::json!({
+            "conversation_id": "d5ec9c1b-eeef-4264-b440-4579b0876514",
+            "session_id": "d5ec9c1b-eeef-4264-b440-4579b0876514",
+            "model": "auto-smart",
+            "hook_event_name": "preToolUse",
+            "cursor_version": "2026.09.02-c22c1a3",
+            "workspace_roots": ["/real/project/path"],
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/real/project/path/sample.txt"}
+        });
+        let env = HookEnvelope::from_query_and_body(q, raw);
+
+        assert_eq!(env.agent, AgentKind::Cursor);
+        assert_eq!(env.event, HookEvent::PreToolUse);
+        assert_eq!(
+            env.session_id.as_deref(),
+            Some("d5ec9c1b-eeef-4264-b440-4579b0876514")
+        );
+        assert_eq!(env.cwd.as_deref(), Some("/real/project/path"));
     }
 
     /// Antigravity CLI identifies the conversation as `conversationId`

@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- The standalone `cursor-agent` CLI (not the Cursor IDE) reports its working
+  directory through `workspace_roots` (a snake_case array), a field
+  `HookEnvelope::from_query_and_body`'s cwd extractor never checked — it only
+  knew `cwd`/`current_dir`/`working_dir`/`directory` and Antigravity CLI's
+  `workspacePaths`. Every real `cursor-agent` hook event landed with
+  `cwd=None`, so sessions fell back to the generic `scratch` project instead
+  of the real repo being worked in. Confirmed live against a real
+  `cursor-agent -p` session (v2026.09.02-c22c1a3) whose `sessionStart`/
+  `preToolUse` payloads carried `workspace_roots` with no `cwd`-shaped key at
+  all.
 - `bootstrap` now retries a chunk's LLM call on a transient error before
   giving up, instead of letting one blip discard the whole multi-chunk run
   (#617). A provider `5xx`/`429` or a transport timeout/connect failure on
