@@ -63,7 +63,8 @@ pub struct AbArgs {
     #[arg(long, default_value = "evals/runs")]
     out: PathBuf,
 
-    /// Baseline provider (`anthropic` / `openai` / `openai-compat` / `openai-oauth` / `copilot`).
+    /// Baseline provider (`anthropic` / `openai` / `openai-compat` /
+    /// `openai-oauth` / `codex` / `copilot`).
     #[arg(long)]
     baseline_provider: String,
 
@@ -83,7 +84,7 @@ pub struct AbArgs {
     #[arg(long)]
     baseline_api_key_env: Option<String>,
 
-    /// Baseline OpenAI OAuth token file for `--baseline-provider openai-oauth`.
+    /// Baseline auth file for `openai-oauth` or `codex`.
     #[arg(long)]
     baseline_token_file: Option<PathBuf>,
 
@@ -107,7 +108,7 @@ pub struct AbArgs {
     #[arg(long)]
     candidate_api_key_env: Option<String>,
 
-    /// Candidate OpenAI OAuth token file for `--candidate-provider openai-oauth`.
+    /// Candidate auth file for `openai-oauth` or `codex`.
     #[arg(long)]
     candidate_token_file: Option<PathBuf>,
 }
@@ -282,10 +283,11 @@ fn resolve_provider(side: &str, args: &AbArgs) -> Result<ResolvedConfig> {
         "openai" => ProviderChoice::OpenAi,
         "openai-compat" | "openai_compat" => ProviderChoice::OpenAiCompat,
         "openai-oauth" | "openai_oauth" => ProviderChoice::OpenAiOAuth,
+        "codex" => ProviderChoice::Codex,
         "copilot" | "github-copilot" | "github_copilot" => ProviderChoice::Copilot,
         other => {
             bail!(
-                "{side}: provider {other} not one of anthropic|openai|openai-compat|openai-oauth|copilot"
+                "{side}: provider {other} not one of anthropic|openai|openai-compat|openai-oauth|codex|copilot"
             )
         }
     };
@@ -311,6 +313,12 @@ fn resolve_provider(side: &str, args: &AbArgs) -> Result<ResolvedConfig> {
                 anyhow::anyhow!("{side}: --{side}-token-file is required for openai-oauth")
             })?)
         }
+        AuthRequirement::CodexAuthFile => ProviderAuth::codex(
+            token_file.ok_or_else(|| {
+                anyhow::anyhow!("{side}: --{side}-token-file is required for codex")
+            })?,
+            "codex",
+        ),
         AuthRequirement::CopilotToken => ProviderAuth::copilot(
             token_file.ok_or_else(|| {
                 anyhow::anyhow!("{side}: --{side}-token-file is required for copilot")
@@ -361,6 +369,10 @@ impl From<ResolvedConfig> for ProviderConfig {
             // effort stays at each model's own default unless a future
             // flag threads it through.
             reasoning_effort: None,
+            // No operator header list here: `build_provider` still layers
+            // the default user agent, which is what a gateway needs to
+            // attribute harness traffic.
+            extra_headers: ai_memory_llm::ExtraHeaders::default(),
         }
     }
 }

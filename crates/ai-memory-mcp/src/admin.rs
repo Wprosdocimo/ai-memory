@@ -218,6 +218,10 @@ struct BootstrapRequest {
     /// Allow re-bootstrap when `wiki/bootstrap.md` already exists.
     #[serde(default)]
     force: bool,
+    /// Resume an interrupted bootstrap: reuse the chunks already completed
+    /// for the same sources instead of re-running them (#621).
+    #[serde(default)]
+    resume: bool,
 }
 
 fn default_max_input_tokens() -> usize {
@@ -412,6 +416,33 @@ const fn default_open_handoffs_limit() -> usize {
     50
 }
 
+/// Query for `GET /admin/messages` (cross-project agent messaging, V64).
+#[derive(Debug, Deserialize)]
+struct ListMessagesQuery {
+    workspace: String,
+    project: String,
+    #[serde(rename = "box", default = "default_message_box")]
+    mailbox: String,
+    #[serde(default = "default_list_messages_limit")]
+    limit: usize,
+}
+
+fn default_message_box() -> String {
+    "inbox".into()
+}
+
+const fn default_list_messages_limit() -> usize {
+    50
+}
+
+/// Body cap for `POST /admin/messages/send` (V64). The body crosses a
+/// project-isolation boundary and is untrusted input on the receiving side;
+/// capped the same way handoff text fields are, after secret-scrubbing.
+const MESSAGE_BODY_MAX_CHARS: usize = 8000;
+
+/// Subject cap for `POST /admin/messages/send` (V64).
+const MESSAGE_SUBJECT_MAX_CHARS: usize = 200;
+
 #[derive(Debug, Deserialize)]
 struct PendingWritesQuery {
     workspace: String,
@@ -588,6 +619,10 @@ pub fn admin_router_with_sweep_tuning(
         .route("/admin/curator", post(handle_curator))
         .route("/admin/handoffs", get(handle_open_handoffs_list))
         .route("/admin/handoffs/expire", post(handle_expire_handoffs))
+        .route("/admin/messages", get(handle_list_messages))
+        .route("/admin/messages/send", post(handle_send_message))
+        .route("/admin/messages/pop", post(handle_pop_message))
+        .route("/admin/messages/cancel", post(handle_cancel_messages))
         .route("/admin/pending-writes", get(handle_pending_writes_list))
         .route(
             "/admin/pending-writes/{id}",
@@ -904,6 +939,16 @@ async fn build_okf_bundle_file(
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if name == "index.md" || name == "log.md" {
                     continue; // regenerated / not adopted
+                }
+                // A rotated event ledger is the same raw hook capture as the
+                // `log.md` above, only past a month boundary — it carries no
+                // frontmatter, so the conformance gate below failed the whole
+                // export for every project that ever captured an observation
+                // (#748). The check is content-gated exactly like the
+                // migration scan's (#669), so a prose page that happens to be
+                // named `log-2026-09.md` still ships and still has to conform.
+                if ai_memory_wiki::is_rotated_event_ledger(&path) {
+                    continue;
                 }
                 let raw = std::fs::read_to_string(&path)?;
                 let fm = ai_memory_wiki::parse(&raw)
@@ -1789,12 +1834,14 @@ async fn handle_bootstrap(
         since: None,
         dry_run: req.dry_run,
         force: req.force,
+        resume: req.resume,
     };
 
     let bootstrap = Bootstrap {
         reader: state.reader.clone(),
         wiki: state.wiki.clone(),
         llm,
+        writer: state.writer.clone(),
     };
 
     match bootstrap.process_sources(&cfg, req.sources).await {
@@ -1824,7 +1871,22 @@ fn bootstrap_error_response(
         BootstrapError::Llm(_) => StatusCode::BAD_GATEWAY,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
+    log_server_error(status, "bootstrap", &e);
     (status, Json(serde_json::json!({ "error": e.to_string() })))
+}
+
+/// Record a failure the server owns.
+///
+/// A 5xx says the request was fine and *we* could not serve it, so the reason
+/// belongs in the server's log: the response body reaches one client once and
+/// is gone when its process exits, which is how an upstream provider 404
+/// managed to fail every bootstrap while the log showed only the run starting
+/// (#692). A 4xx stays quiet — the caller was told, and the caller was at
+/// fault.
+fn log_server_error(status: StatusCode, operation: &str, error: &dyn std::fmt::Display) {
+    if status.is_server_error() {
+        warn!(%status, operation, %error, "admin request failed");
+    }
 }
 
 /// Build a dry-run [`BootstrapOutcome`] without an LLM by applying the
@@ -2284,6 +2346,7 @@ fn auto_improve_error_response(
         AutoImproveError::Memory(_) => StatusCode::BAD_REQUEST,
         AutoImproveError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
+    log_server_error(status, "auto-improve", &e);
     (status, Json(serde_json::json!({ "error": e.to_string() })))
 }
 
@@ -2616,6 +2679,253 @@ async fn handle_expire_handoffs(
                 "workspace": req.workspace,
                 "project": req.project,
             })),
+        ),
+        Err(e) => internal_err(e.to_string()),
+    }
+}
+
+/// List one side of a project's cross-project mailbox (V64): `box=inbox`
+/// (default) is mail addressed to it, `box=outbox` is mail it has sent and
+/// can still cancel. Oldest first, capped at `limit`. See
+/// `docs/agent-messaging.md`.
+async fn handle_list_messages(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<ListMessagesQuery>,
+) -> impl IntoResponse {
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let mailbox = match query.mailbox.as_str() {
+        "inbox" => ai_memory_core::MessageBox::Inbox,
+        "outbox" => ai_memory_core::MessageBox::Outbox,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("box must be \"inbox\" or \"outbox\", got {other:?}")
+                })),
+            );
+        }
+    };
+    let limit = query.limit.clamp(1, 200);
+    match state.reader.list_messages(ws, proj, mailbox, limit).await {
+        Ok(messages) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "messages": messages })),
+        ),
+        Err(e) => internal_err(e.to_string()),
+    }
+}
+
+/// `POST /admin/messages/send` request body (V64).
+#[derive(Debug, Deserialize)]
+struct SendMessageRequest {
+    from_workspace: String,
+    from_project: String,
+    to_workspace: String,
+    to_project: String,
+    #[serde(default)]
+    subject: Option<String>,
+    body: String,
+}
+
+/// Map a message-store failure to a response. `InvalidState` is the
+/// full-inbox rejection (`ops::MAX_PENDING_INBOX_MESSAGES`) — a caller error,
+/// not a server fault, so it surfaces as 409 rather than 500 (mirrors
+/// [`map_user_store_err`]).
+fn map_message_store_err(e: StoreError) -> (StatusCode, Json<serde_json::Value>) {
+    match e {
+        StoreError::InvalidState(msg) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": msg })),
+        ),
+        other => internal_err(other.to_string()),
+    }
+}
+
+/// `POST /admin/messages/send` — drop a message into another project's
+/// inbox (V64). Both scopes are resolved with the no-create lookup: sending
+/// to a typo'd project must fail closed rather than silently creating it.
+///
+/// Security: `body` and `subject` are secret-scrubbed with the same
+/// [`ai_memory_core::Sanitizer`] the hook ingress uses before they are
+/// capped and stored — this endpoint is not a path around redaction.
+async fn handle_send_message(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Json(req): Json<SendMessageRequest>,
+) -> impl IntoResponse {
+    let (from_ws, from_proj) =
+        match lookup_ws_proj_no_create(&state, &req.from_workspace, &req.from_project).await {
+            Ok(ids) => ids,
+            Err(e) => return e,
+        };
+    let (to_ws, to_proj) =
+        match lookup_ws_proj_no_create(&state, &req.to_workspace, &req.to_project).await {
+            Ok(ids) => ids,
+            Err(e) => return e,
+        };
+
+    let sanitizer = ai_memory_core::Sanitizer::builtin();
+    let body =
+        ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(&req.body), MESSAGE_BODY_MAX_CHARS);
+    let subject = req
+        .subject
+        .as_deref()
+        .map(|s| {
+            ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(s), MESSAGE_SUBJECT_MAX_CHARS)
+        })
+        .filter(|s| !s.is_empty());
+
+    let distinguishes = match state
+        .reader
+        .distinguishes_operators(state.trusted_proxy_identity)
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => return internal_err(e.to_string()),
+    };
+    // Owner is the sender's storage key, same as `handoff_begin` — attribution
+    // only (never a read filter), and `None` when the actor is anonymous or
+    // the deployment doesn't tell its operators apart.
+    let from_owner_user = ai_memory_core::owner_stamp(
+        actor_ext
+            .as_ref()
+            .and_then(|axum::Extension(actor)| actor.identity_key())
+            .as_ref(),
+        distinguishes,
+    );
+
+    let message = ai_memory_core::NewAgentMessage {
+        from_workspace_id: from_ws,
+        from_project_id: from_proj,
+        from_agent: AgentKind::Other,
+        from_session_id: None,
+        from_owner_user,
+        to_workspace_id: to_ws,
+        to_project_id: to_proj,
+        subject,
+        body,
+    };
+
+    match state.writer.insert_message(message).await {
+        Ok(id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "message_id": id.to_string() })),
+        ),
+        Err(e) => map_message_store_err(e),
+    }
+}
+
+/// `POST /admin/messages/pop` request body (V64).
+#[derive(Debug, Deserialize)]
+struct PopMessageRequest {
+    workspace: String,
+    project: String,
+    #[serde(default)]
+    message_id: Option<String>,
+}
+
+fn parse_optional_message_id(
+    raw: Option<&str>,
+) -> Result<Option<ai_memory_core::MessageId>, (StatusCode, Json<serde_json::Value>)> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::parse::<ai_memory_core::MessageId>)
+        .transpose()
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "message_id must be a full UUID" })),
+            )
+        })
+}
+
+/// `POST /admin/messages/pop` — claim exactly one pending message from this
+/// project's inbox (V64). With `message_id`, pops that one; otherwise the
+/// oldest pending. Returns `{"message": null}` when nothing matched.
+async fn handle_pop_message(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Json(req): Json<PopMessageRequest>,
+) -> impl IntoResponse {
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let specific_id = match parse_optional_message_id(req.message_id.as_deref()) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    let distinguishes = match state
+        .reader
+        .distinguishes_operators(state.trusted_proxy_identity)
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => return internal_err(e.to_string()),
+    };
+    let claiming_user = ai_memory_core::owner_stamp(
+        actor_ext
+            .as_ref()
+            .and_then(|axum::Extension(actor)| actor.identity_key())
+            .as_ref(),
+        distinguishes,
+    );
+
+    let claim = ai_memory_core::MessageClaim {
+        workspace_id: ws,
+        project_id: proj,
+        claiming_agent: AgentKind::Other,
+        claiming_session: None,
+        claiming_user,
+    };
+
+    match state.writer.pop_message(claim, specific_id).await {
+        Ok(Some(message)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "message": message,
+                "security_notice": ai_memory_core::UNTRUSTED_MESSAGE_NOTICE,
+            })),
+        ),
+        Ok(None) => (StatusCode::OK, Json(serde_json::json!({ "message": null }))),
+        Err(e) => internal_err(e.to_string()),
+    }
+}
+
+/// `POST /admin/messages/cancel` request body (V64).
+#[derive(Debug, Deserialize)]
+struct CancelMessagesRequest {
+    workspace: String,
+    project: String,
+    #[serde(default)]
+    message_id: Option<String>,
+}
+
+/// `POST /admin/messages/cancel` — retract still-pending outbox messages
+/// this project sent (V64). With `message_id`, cancels just that one;
+/// otherwise every pending message the project has sent.
+async fn handle_cancel_messages(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<CancelMessagesRequest>,
+) -> impl IntoResponse {
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let specific_id = match parse_optional_message_id(req.message_id.as_deref()) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    match state.writer.cancel_messages(ws, proj, specific_id).await {
+        Ok(cancelled) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "cancelled": cancelled })),
         ),
         Err(e) => internal_err(e.to_string()),
     }
@@ -3559,6 +3869,39 @@ struct PurgeSessionRequest {
     compact: bool,
 }
 
+/// Wire-format summary returned by `POST /admin/purge-session`.
+#[derive(Debug, Serialize)]
+pub struct PurgeSessionReport {
+    /// Session id that was purged.
+    pub session_id: String,
+    /// Human workspace name.
+    pub workspace: String,
+    /// Human project name.
+    pub project: String,
+    /// Number of observations deleted.
+    pub observations_deleted: u64,
+    /// Number of authored handoffs deleted.
+    pub handoffs_deleted: u64,
+    /// Number of page rows deleted, counting superseded versions.
+    pub pages_deleted: u64,
+    /// Number of auto-improvement runs deleted.
+    pub auto_improve_runs_deleted: u64,
+    /// Distinct wiki page paths whose database rows were deleted.
+    pub removed_paths: Vec<PagePath>,
+    /// Distinct wiki page paths removed from disk after the database purge.
+    pub files_deleted: Vec<PagePath>,
+    /// Distinct wiki page paths that could not be removed from disk.
+    pub files_failed: Vec<PagePath>,
+    /// Whether the freed bytes were reclaimed (`VACUUM` ran).
+    pub compacted: bool,
+    /// Pre-purge checkpoint, if the tree had uncommitted changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_checkpoint: Option<String>,
+    /// Post-purge checkpoint, if the purge changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
 /// `POST /admin/purge-session` — delete one session and everything derived
 /// from it, inside a single workspace/project scope.
 async fn handle_purge_session(
@@ -3605,13 +3948,21 @@ async fn handle_purge_session(
         actor,
         ..Default::default()
     };
-    if let Err(e) = state
+    let mut dispatch_ctx = match state
         .wiki
         .admit_purge_session(ws_id, proj_id, Some(ctx))
         .await
     {
-        return internal_err(e.to_string());
-    }
+        Ok(ctx) => ctx,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    let label = format!("{}/{}: {}", req.workspace, req.project, session_id);
+    let pre_checkpoint = match checkpoint_or_500(&state.wiki, format!("pre-purge-session {label}"))
+    {
+        Ok(oid) => oid,
+        Err(e) => return e,
+    };
 
     let compaction = if req.compact {
         ai_memory_store::Compaction::Reclaim
@@ -3619,14 +3970,14 @@ async fn handle_purge_session(
         ai_memory_store::Compaction::Skip
     };
 
-    let summary = match state
-        .writer
+    let outcome = match state
+        .wiki
         .purge_session(ws_id, proj_id, session_id, author_id, compaction)
         .await
     {
         Ok(s) => s,
         // Absent from this scope (or already purged) is a 404, not a fault.
-        Err(e @ StoreError::NotFound(_)) => {
+        Err(WikiError::Store(e @ StoreError::NotFound(_))) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": e.to_string() })),
@@ -3635,20 +3986,37 @@ async fn handle_purge_session(
         Err(e) => return internal_err(e.to_string()),
     };
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "session_id": session_id.to_string(),
-            "workspace": req.workspace,
-            "project": req.project,
-            "observations_deleted": summary.observations_deleted,
-            "handoffs_deleted": summary.handoffs_deleted,
-            "pages_deleted": summary.pages_deleted,
-            "auto_improve_runs_deleted": summary.auto_improve_runs_deleted,
-            "removed_paths": summary.removed_paths,
-            "compacted": summary.compacted,
-        })),
-    )
+    let ai_memory_wiki::PurgeSessionOutcome {
+        summary,
+        files_deleted,
+        files_failed,
+    } = outcome;
+    if !files_failed.is_empty()
+        && let Some(ref mut ctx) = dispatch_ctx
+    {
+        ctx.partial_failure = true;
+    }
+    state.wiki.dispatch_purge(dispatch_ctx.as_ref());
+
+    let checkpoint = checkpoint_or_warn(&state.wiki, format!("purge-session {label}"));
+
+    let report = PurgeSessionReport {
+        session_id: session_id.to_string(),
+        workspace: req.workspace,
+        project: req.project,
+        observations_deleted: summary.observations_deleted,
+        handoffs_deleted: summary.handoffs_deleted,
+        pages_deleted: summary.pages_deleted,
+        auto_improve_runs_deleted: summary.auto_improve_runs_deleted,
+        removed_paths: summary.removed_paths,
+        files_deleted,
+        files_failed,
+        compacted: summary.compacted,
+        pre_checkpoint,
+        checkpoint,
+    };
+
+    (StatusCode::OK, Json(json_or_empty(&report)))
 }
 
 // ---------------------------------------------------------------------
@@ -3888,7 +4256,7 @@ async fn handle_purge_project(
     {
         c.partial_failure = true;
     }
-    state.wiki.dispatch_purge_project(dispatch_ctx.as_ref());
+    state.wiki.dispatch_purge(dispatch_ctx.as_ref());
 
     state.active_project.clear_project(proj_id);
     invalidate_scope_cache(&state, ScopeInvalidation::Project(proj_id)).await;
@@ -4217,7 +4585,7 @@ async fn delete_workspace_core(
     {
         c.partial_failure = true;
     }
-    state.wiki.dispatch_purge_workspace(dispatch_ctx.as_ref());
+    state.wiki.dispatch_purge(dispatch_ctx.as_ref());
 
     state.active_project.clear_workspace(ws_id);
     invalidate_scope_cache(state, ScopeInvalidation::Workspace(ws_id)).await;
@@ -5964,6 +6332,7 @@ async fn copy_purge_merge(
                 }),
                 author_id: None,
                 actor: actor.clone(),
+                evidence: Vec::new(),
             })
             .await
         {
@@ -6111,7 +6480,7 @@ async fn copy_purge_merge(
     {
         c.partial_failure = true;
     }
-    state.wiki.dispatch_purge_project(dispatch_ctx.as_ref());
+    state.wiki.dispatch_purge(dispatch_ctx.as_ref());
 
     // The source project_id was just purged; if it was the published active
     // project, the pointer now dangles — clear it so the next hook re-resolves
@@ -6396,6 +6765,12 @@ async fn handle_write_page(
             Json(serde_json::json!({ "error": format!("invalid path: {e}") })),
         )
     })?;
+    path.ensure_portable().map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": format!("invalid path: {e}") })),
+        )
+    })?;
 
     let (ws, proj) = create_ws_proj(&state, &req.workspace, &req.project).await?;
 
@@ -6458,6 +6833,7 @@ async fn handle_write_page(
             admission_ctx,
             author_id,
             actor,
+            evidence: Vec::new(),
         })
         .await
         .map_err(|e| internal_err(e.to_string()))?;
@@ -8206,15 +8582,170 @@ mod tests {
         );
     }
 
-    /// A bundle with a non-conformant page must fail the export rather
-    /// than ship something a strict reader rejects.
+    /// The project root of any store that ever captured an observation
+    /// holds a rotated hook ledger (`log-YYYY-MM.md`, no frontmatter).
+    /// It is raw capture, not a concept file: the export drops it the
+    /// way it already drops `log.md`, instead of failing the whole
+    /// bundle on the conformance gate (#748). Both shapes are covered —
+    /// a bare ledger and one the OKF migration stamped frontmatter onto.
     #[tokio::test]
-    async fn export_okf_refuses_a_nonconformant_page() {
+    async fn export_okf_skips_the_rotated_event_ledger() {
         let (tmp, router) = read_page_test_router();
         post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
-        // Fabricate a pre-migration file next to it. The wiki root also
-        // holds `.git`; read_dir order is arbitrary, so select the
-        // UUID-named scope dirs explicitly.
+        let proj_dir = scratch_project_dir(tmp.path());
+        std::fs::write(
+            proj_dir.join("log-2026-08.md"),
+            "## [2026-08-01T00:00:00Z] session_start | opened scratch\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj_dir.join("log-2026-07.md"),
+            "---\ntype: Note\n---\n\n## [2026-07-01T00:00:00Z] session_start | opened scratch\n",
+        )
+        .unwrap();
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dec = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes.to_vec()));
+        let mut ar = tar::Archive::new(dec);
+        let names: Vec<String> = ar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().display().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "notes/a.md"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.starts_with("log-")),
+            "raw event ledgers must not ship: {names:?}"
+        );
+    }
+
+    /// End-to-end companion to the hand-written ledger test above: the
+    /// export must drop the ledger the REAL capture path produces, not
+    /// merely a file whose bytes a test typed by hand. #748 was exactly a
+    /// disagreement between two subsystems — the hook that appends
+    /// `log-YYYY-MM.md` and the export that walked it — so the regression
+    /// is only truly guarded when the ledger under test is the one
+    /// `ai_memory_hooks::log::append_event` itself writes, named for the
+    /// event's own month.
+    #[tokio::test]
+    async fn export_okf_skips_the_ledger_real_capture_writes() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki.clone()));
+
+        // A real knowledge page, created through the normal write path.
+        post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+
+        // The rotated ledger, created the way capture creates it: the exact
+        // `append_event` the hook router calls, which names the file for the
+        // event's own month (`log-YYYY-MM.md`) and writes a frontmatter-less
+        // `## [ts] ...` entry.
+        let scope = lookup_existing_scope(&store.reader, "default", "scratch")
+            .await
+            .unwrap();
+        ai_memory_hooks::log::append_event(
+            &wiki,
+            scope.workspace_id,
+            scope.project_id,
+            jiff::Timestamp::now(),
+            ai_memory_hooks::HookEvent::SessionStart,
+            "opened scratch",
+        )
+        .unwrap();
+
+        // Guard against a vacuous pass: capture must actually have written a
+        // rotated ledger into the project root the export walks.
+        let proj_root = wiki.project_root(scope.workspace_id, scope.project_id);
+        assert!(
+            std::fs::read_dir(&proj_root)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("log-")),
+            "capture must have written a rotated ledger for the test to be meaningful"
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Export succeeds instead of aborting on the frontmatter-less ledger.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dec = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes.to_vec()));
+        let mut ar = tar::Archive::new(dec);
+        let names: Vec<String> = ar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().display().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "notes/a.md"),
+            "the real knowledge page must ship: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("log-")),
+            "the ledger real capture wrote must not ship: {names:?}"
+        );
+    }
+
+    /// Content gate control for #748: the ledger carve-out keys off the
+    /// body, so an ordinary page named like a ledger is still a page —
+    /// it ships in the bundle, and it still has to declare a `type`.
+    #[tokio::test]
+    async fn export_okf_still_conforms_a_prose_page_named_like_a_ledger() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+        let proj_dir = scratch_project_dir(tmp.path());
+        std::fs::write(
+            proj_dir.join("log-2026-09.md"),
+            "---\ntitle: September log\n---\n\nProse about last month, not hook output.\n",
+        )
+        .unwrap();
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// The single project scope dir under a freshly seeded `scratch`
+    /// store. The wiki root also holds `.git`, and `read_dir` order is
+    /// arbitrary, so the UUID-named scope dirs are selected explicitly.
+    fn scratch_project_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
         let uuid_dir = |parent: &std::path::Path| {
             std::fs::read_dir(parent)
                 .unwrap()
@@ -8223,8 +8754,17 @@ mod tests {
                 .find(|p| p.is_dir() && p.file_name().is_none_or(|n| n != ".git"))
                 .expect("scope dir")
         };
-        let ws_dir = uuid_dir(&tmp.path().join("wiki"));
-        let proj_dir = uuid_dir(&ws_dir);
+        uuid_dir(&uuid_dir(&data_dir.join("wiki")))
+    }
+
+    /// A bundle with a non-conformant page must fail the export rather
+    /// than ship something a strict reader rejects.
+    #[tokio::test]
+    async fn export_okf_refuses_a_nonconformant_page() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+        // Fabricate a pre-migration file next to it.
+        let proj_dir = scratch_project_dir(tmp.path());
         std::fs::write(
             proj_dir.join("notes/legacy.md"),
             "---\ntitle: Legacy\n---\nno type here",
@@ -8370,6 +8910,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "write-page setup failed");
+    }
+
+    #[tokio::test]
+    async fn admin_write_page_refuses_git_reserved_and_non_portable_paths() {
+        let (_tmp, router) = read_page_test_router();
+        for bad in [
+            ".git",
+            ".git/config",
+            "notes/.git",
+            "notes/.git/sub.md",
+            "notes/git~1",
+            "notes/git~1/foo.md",
+            "CON.md",
+            "notes/aux.md",
+            "notes/a|b.md",
+        ] {
+            let req_body = serde_json::json!({
+                "workspace": "default",
+                "project": "audit",
+                "path": bad,
+                "body": "bad path body",
+            });
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/admin/write-page")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "expected 422 for {bad:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -8533,6 +9113,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -8688,6 +9269,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -8827,6 +9409,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -8944,6 +9527,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();

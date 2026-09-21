@@ -8,13 +8,15 @@ use std::sync::Arc;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::AnthropicProvider;
+use crate::CodexProvider;
+use crate::CopilotEmbedder;
 use crate::CopilotProvider;
 use crate::GeminiProvider;
 use crate::OpenAiCompatProvider;
 use crate::OpenAiOAuthProvider;
 use crate::OpenAiProvider;
 use crate::OpenCodeProvider;
-use crate::auth::{AuthRequirement, ProviderAuth};
+use crate::auth::{AuthRequirement, CopilotAuth, ProviderAuth};
 use crate::embedding::{Embedder, OpenAiCompatEmbedder, OpenAiEmbedder, VoyageEmbedder};
 use crate::error::{LlmError, LlmResult};
 use crate::google::GoogleEmbedder;
@@ -33,11 +35,14 @@ pub enum ProviderChoice {
     OpenAiCompat,
     /// OpenAI ChatGPT/Codex OAuth backend.
     OpenAiOAuth,
+    /// Codex CLI-owned auth with refresh delegated to `codex app-server`.
+    Codex,
     /// GitHub Copilot Chat backend.
     Copilot,
     /// Anthropic Messages API via a Claude-subscription OAuth token.
     AnthropicOAuth,
-    /// OpenCode Zen/Go cloud API (OpenAI-compatible endpoint).
+    /// OpenCode cloud API (OpenAI-compatible endpoint). Defaults to the Go
+    /// endpoint; `base_url` selects Zen's general catalogue instead.
     OpenCode,
 }
 
@@ -51,6 +56,7 @@ impl ProviderChoice {
             Self::Gemini => "gemini",
             Self::OpenAiCompat => "openai-compat",
             Self::OpenAiOAuth => "openai-oauth",
+            Self::Codex => "codex",
             Self::Copilot => "copilot",
             Self::AnthropicOAuth => "anthropic-oauth",
             Self::OpenCode => "opencode",
@@ -74,12 +80,29 @@ impl ProviderChoice {
                 env_var: "LLM_API_KEY",
             },
             Self::OpenAiOAuth => AuthRequirement::OpenAiOAuthToken,
+            Self::Codex => AuthRequirement::CodexAuthFile,
             Self::Copilot => AuthRequirement::CopilotToken,
             Self::AnthropicOAuth => AuthRequirement::AnthropicOAuthToken,
             Self::OpenCode => AuthRequirement::RequiredApiKey {
                 env_var: "OPENCODE_API_KEY",
             },
         }
+    }
+
+    /// Whether the operator, rather than the vendor, decides where this
+    /// provider's endpoint lives.
+    ///
+    /// True for the self-hosted / aggregator dialects: `openai-compat` has
+    /// no endpoint at all without one, and `opencode` reaches Zen's general
+    /// catalogue only through an override. Every other provider talks to a
+    /// fixed vendor host, and a base URL aimed elsewhere does not speak its
+    /// dialect — a Gemini request against an Ollama host is a 404, not a
+    /// degraded answer. Callers use this to decide whether an *ambient*
+    /// base URL (the cross-tool `LLM_BASE_URL` convention) may configure the
+    /// provider; an explicit ai-memory setting always may.
+    #[must_use]
+    pub const fn endpoint_is_operator_chosen(self) -> bool {
+        matches!(self, Self::OpenAiCompat | Self::OpenCode)
     }
 }
 
@@ -109,6 +132,12 @@ pub struct ProviderConfig {
     /// `output_config.effort`, Codex `reasoning.effort`). `None` omits
     /// the field so the model default applies. Gemini and Copilot ignore it.
     pub reasoning_effort: Option<crate::ReasoningEffort>,
+    /// Operator-supplied HTTP headers sent on every chat request. Gateways
+    /// that require a caller-identifying header (OpenCode asks for
+    /// `x-opencode-session` and a specific `User-Agent`) are configured
+    /// through this rather than per-provider special cases. Parsed once from
+    /// `AI_MEMORY_LLM_HEADERS` by `Config::load`; empty by default.
+    pub extra_headers: crate::ExtraHeaders,
 }
 
 /// Embedding providers available to ai-memory.
@@ -129,6 +158,9 @@ pub enum EmbedderChoice {
     /// manually; docs/local-embeddings.md).
     #[cfg(feature = "local-embeddings")]
     Local,
+    /// GitHub Copilot's OpenAI-compatible `/embeddings` endpoint. Reuses the
+    /// Copilot OAuth login (no separate API key).
+    Copilot,
 }
 
 impl EmbedderChoice {
@@ -143,6 +175,7 @@ impl EmbedderChoice {
             Self::OpenAiCompat => "openai-compat",
             #[cfg(feature = "local-embeddings")]
             Self::Local => "local",
+            Self::Copilot => "copilot",
         }
     }
 }
@@ -164,6 +197,9 @@ pub struct EmbedderConfig {
     pub base_url: Option<String>,
     /// `<data_dir>/models/` root, required by the `local` provider.
     pub models_dir: Option<std::path::PathBuf>,
+    /// Resolved Copilot auth, required by the `copilot` provider. `None`
+    /// for every other provider.
+    pub copilot_auth: Option<CopilotAuth>,
     /// True when no provider was configured and `local` was chosen as
     /// the 2.0 default. Best-effort semantics: a defaulted embedder
     /// that cannot fetch or load its model degrades to no-embedder with
@@ -224,6 +260,12 @@ pub fn build_embedder(config: EmbedderConfig) -> LlmResult<Arc<dyn Embedder>> {
             })?;
             Arc::new(crate::local::LocalEmbedder::load(&models_dir)?)
         }
+        EmbedderChoice::Copilot => {
+            let auth = config.copilot_auth.ok_or_else(|| {
+                LlmError::NotConfigured("copilot embedding provider requires Copilot auth".into())
+            })?;
+            Arc::new(CopilotEmbedder::new(auth, config.model, config.dim)?)
+        }
     };
     Ok(arc)
 }
@@ -253,7 +295,52 @@ pub fn try_default_embedding_dim(provider: EmbedderChoice, model: &str) -> Optio
         (EmbedderChoice::Google, "gemini-embedding-001") => Some(768),
         (EmbedderChoice::Google, _) => Some(768),
         (EmbedderChoice::OpenAiCompat, _) => None,
+        (EmbedderChoice::Copilot, _) => Some(crate::copilot::COPILOT_DEFAULT_EMBED_DIM),
     }
+}
+
+/// Layer [`crate::DEFAULT_USER_AGENT`] under the operator's headers so every
+/// provider request identifies ai-memory, while an explicit
+/// `AI_MEMORY_LLM_HEADERS` entry still wins.
+///
+/// Copilot is excluded: its client and per-request headers both carry
+/// [`crate::COPILOT_USER_AGENT`], the editor-plugin agent GitHub's Copilot
+/// API expects, and `ExtraHeaders` replaces rather than appends — so a
+/// default here would silently break that provider.
+fn with_default_user_agent(
+    provider: ProviderChoice,
+    mut headers: crate::ExtraHeaders,
+) -> crate::ExtraHeaders {
+    if provider != ProviderChoice::Copilot {
+        headers.set_default(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_static(crate::DEFAULT_USER_AGENT),
+        );
+    }
+    headers
+}
+
+/// Layer OpenRouter's app-attribution headers (`HTTP-Referer`, `X-Title`)
+/// under the operator's headers when the `openai-compat` base URL points at
+/// OpenRouter, so ai-memory's usage shows up on OpenRouter's app leaderboard
+/// without requiring `AI_MEMORY_LLM_HEADERS` configuration. An explicit
+/// operator entry for either header still wins, same precedence as the
+/// default user agent.
+fn with_default_openrouter_headers(
+    base_url: &str,
+    mut headers: crate::ExtraHeaders,
+) -> crate::ExtraHeaders {
+    if crate::openai::is_openrouter_base(base_url) {
+        headers.set_default(
+            reqwest::header::HeaderName::from_static("http-referer"),
+            reqwest::header::HeaderValue::from_static(crate::OPENROUTER_HTTP_REFERER),
+        );
+        headers.set_default(
+            reqwest::header::HeaderName::from_static("x-title"),
+            reqwest::header::HeaderValue::from_static(crate::OPENROUTER_X_TITLE),
+        );
+    }
+    headers
 }
 
 /// Construct an `Arc<dyn LlmProvider>` matching the config.
@@ -263,13 +350,15 @@ pub fn try_default_embedding_dim(provider: EmbedderChoice, model: &str) -> Optio
 /// key, base URL) is missing.
 pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>> {
     let timeout = config.request_timeout_secs;
+    let extra_headers = with_default_user_agent(config.provider, config.extra_headers);
     match config.provider {
         ProviderChoice::Anthropic => {
             let key = config.auth.require_api_key()?;
             Ok(Arc::new(
                 AnthropicProvider::new(key, config.model)?
                     .with_timeout_secs(timeout)
-                    .with_reasoning_effort(config.reasoning_effort),
+                    .with_reasoning_effort(config.reasoning_effort)
+                    .with_extra_headers(extra_headers),
             ))
         }
         ProviderChoice::OpenAi => {
@@ -277,7 +366,8 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             Ok(Arc::new(
                 OpenAiProvider::new(key, config.model)?
                     .with_timeout_secs(timeout)
-                    .with_reasoning_effort(config.reasoning_effort),
+                    .with_reasoning_effort(config.reasoning_effort)
+                    .with_extra_headers(extra_headers),
             ))
         }
         ProviderChoice::Gemini => {
@@ -286,17 +376,23 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             if let Some(url) = config.base_url {
                 provider = provider.with_base_url(url);
             }
-            Ok(Arc::new(provider.with_timeout_secs(timeout)))
+            Ok(Arc::new(
+                provider
+                    .with_timeout_secs(timeout)
+                    .with_extra_headers(extra_headers),
+            ))
         }
         ProviderChoice::OpenAiCompat => {
             let base = config
                 .base_url
                 .ok_or_else(|| LlmError::NotConfigured("LLM_BASE_URL".into()))?;
+            let extra_headers = with_default_openrouter_headers(&base, extra_headers);
             Ok(Arc::new(
                 OpenAiCompatProvider::new(base, config.auth.optional_api_key(), config.model)?
                     .with_strict(config.compat_strict)
                     .with_timeout_secs(timeout)
-                    .with_reasoning_effort(config.reasoning_effort),
+                    .with_reasoning_effort(config.reasoning_effort)
+                    .with_extra_headers(extra_headers),
             ))
         }
         ProviderChoice::OpenAiOAuth => {
@@ -304,13 +400,25 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             Ok(Arc::new(
                 OpenAiOAuthProvider::new(path, config.model)?
                     .with_timeout_secs(timeout)
-                    .with_reasoning_effort(config.reasoning_effort),
+                    .with_reasoning_effort(config.reasoning_effort)
+                    .with_extra_headers(extra_headers),
+            ))
+        }
+        ProviderChoice::Codex => {
+            let auth = config.auth.require_codex_auth()?;
+            Ok(Arc::new(
+                CodexProvider::new(auth, config.model)?
+                    .with_timeout_secs(timeout)
+                    .with_reasoning_effort(config.reasoning_effort)
+                    .with_extra_headers(extra_headers),
             ))
         }
         ProviderChoice::Copilot => {
             let auth = config.auth.require_copilot_auth()?;
             Ok(Arc::new(
-                CopilotProvider::new(auth, config.model)?.with_timeout_secs(timeout),
+                CopilotProvider::new(auth, config.model)?
+                    .with_timeout_secs(timeout)
+                    .with_extra_headers(extra_headers),
             ))
         }
         ProviderChoice::AnthropicOAuth => {
@@ -322,15 +430,25 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
             Ok(Arc::new(
                 provider
                     .with_timeout_secs(timeout)
-                    .with_reasoning_effort(config.reasoning_effort),
+                    .with_reasoning_effort(config.reasoning_effort)
+                    .with_extra_headers(extra_headers),
             ))
         }
         ProviderChoice::OpenCode => {
             let key = config.auth.require_api_key()?;
+            // Defaults to Go; an operator reaches Zen's general catalogue
+            // through AI_MEMORY_LLM_BASE_URL. Silently dropping the override
+            // (as this arm used to) left `provider=opencode` unable to speak
+            // to anything but Go.
+            let mut provider = OpenCodeProvider::new(key, config.model)?;
+            if let Some(url) = config.base_url {
+                provider = provider.with_base_url(url);
+            }
             Ok(Arc::new(
-                OpenCodeProvider::new(key, config.model)?
+                provider
                     .with_timeout_secs(timeout)
-                    .with_reasoning_effort(config.reasoning_effort),
+                    .with_reasoning_effort(config.reasoning_effort)
+                    .with_extra_headers(extra_headers),
             ))
         }
     }
@@ -339,6 +457,33 @@ pub fn build_provider(config: ProviderConfig) -> LlmResult<Arc<dyn LlmProvider>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Exhaustive on purpose: adding a provider must be a decision about whose
+    // endpoint it is, not a default inherited from whichever arm was copied.
+    #[test]
+    fn only_the_operator_supplied_dialects_accept_an_ambient_base_url() {
+        for choice in [ProviderChoice::OpenAiCompat, ProviderChoice::OpenCode] {
+            assert!(
+                choice.endpoint_is_operator_chosen(),
+                "{} has no endpoint without an operator-supplied one",
+                choice.name()
+            );
+        }
+        for choice in [
+            ProviderChoice::Anthropic,
+            ProviderChoice::OpenAi,
+            ProviderChoice::Gemini,
+            ProviderChoice::OpenAiOAuth,
+            ProviderChoice::Copilot,
+            ProviderChoice::AnthropicOAuth,
+        ] {
+            assert!(
+                !choice.endpoint_is_operator_chosen(),
+                "{} talks to a fixed vendor host",
+                choice.name()
+            );
+        }
+    }
 
     #[test]
     fn provider_choices_declare_current_auth_requirements() {
@@ -370,6 +515,11 @@ mod tests {
             ProviderChoice::OpenAiOAuth.auth_requirement(),
             AuthRequirement::OpenAiOAuthToken
         );
+        assert_eq!(ProviderChoice::Codex.name(), "codex");
+        assert_eq!(
+            ProviderChoice::Codex.auth_requirement(),
+            AuthRequirement::CodexAuthFile
+        );
         assert_eq!(
             ProviderChoice::Copilot.auth_requirement(),
             AuthRequirement::CopilotToken
@@ -378,6 +528,77 @@ mod tests {
             ProviderChoice::AnthropicOAuth.auth_requirement(),
             AuthRequirement::AnthropicOAuthToken
         );
+    }
+
+    /// `reqwest` sends no `User-Agent` unless configured, which left every
+    /// ai-memory provider request anonymous.
+    #[test]
+    fn default_user_agent_is_layered_under_operator_headers() {
+        let headers =
+            with_default_user_agent(ProviderChoice::OpenCode, crate::ExtraHeaders::default());
+        assert_eq!(headers.get("user-agent"), Some(crate::DEFAULT_USER_AGENT));
+    }
+
+    #[test]
+    fn an_operator_user_agent_wins_over_the_default() {
+        let operator = crate::ExtraHeaders::parse(["user-agent: ai-memory-fork/9"]).unwrap();
+        let headers = with_default_user_agent(ProviderChoice::OpenAi, operator);
+        assert_eq!(headers.get("user-agent"), Some("ai-memory-fork/9"));
+    }
+
+    /// GitHub's Copilot API expects the editor-plugin agent; `ExtraHeaders`
+    /// replaces rather than appends, so a default here would break it.
+    #[test]
+    fn copilot_is_left_with_its_editor_plugin_user_agent() {
+        let headers =
+            with_default_user_agent(ProviderChoice::Copilot, crate::ExtraHeaders::default());
+        assert_eq!(headers.get("user-agent"), None);
+    }
+
+    /// "Properly identifies itself (no broad user agents)" means naming
+    /// ai-memory and a version — never impersonating another client.
+    #[test]
+    fn default_user_agent_names_ai_memory_with_a_version() {
+        let ua = crate::DEFAULT_USER_AGENT;
+        assert!(ua.starts_with("ai-memory/"), "{ua}");
+        assert!(ua.len() > "ai-memory/".len(), "{ua} carries no version");
+        assert!(!ua.contains("opencode"), "{ua} impersonates another client");
+    }
+
+    /// OpenRouter attributes usage on its app leaderboard by these headers;
+    /// without a default, a plain `openai-compat` setup pointed at
+    /// OpenRouter would arrive unattributed.
+    #[test]
+    fn openrouter_app_headers_are_layered_for_an_openrouter_base_url() {
+        let headers = with_default_openrouter_headers(
+            "https://openrouter.ai/api/v1",
+            crate::ExtraHeaders::default(),
+        );
+        assert_eq!(
+            headers.get("http-referer"),
+            Some(crate::OPENROUTER_HTTP_REFERER)
+        );
+        assert_eq!(headers.get("x-title"), Some(crate::OPENROUTER_X_TITLE));
+    }
+
+    /// A self-hosted `openai-compat` endpoint (Ollama, vLLM, LM Studio) has
+    /// no leaderboard to attribute to, so it must not receive these.
+    #[test]
+    fn openrouter_app_headers_are_absent_for_a_non_openrouter_base_url() {
+        let headers = with_default_openrouter_headers(
+            "http://localhost:11434/v1",
+            crate::ExtraHeaders::default(),
+        );
+        assert_eq!(headers.get("http-referer"), None);
+        assert_eq!(headers.get("x-title"), None);
+    }
+
+    #[test]
+    fn an_operator_http_referer_wins_over_the_openrouter_default() {
+        let operator = crate::ExtraHeaders::parse(["http-referer: https://example.com"]).unwrap();
+        let headers = with_default_openrouter_headers("https://openrouter.ai/api/v1", operator);
+        assert_eq!(headers.get("http-referer"), Some("https://example.com"));
+        assert_eq!(headers.get("x-title"), Some(crate::OPENROUTER_X_TITLE));
     }
 
     #[test]
@@ -390,6 +611,7 @@ mod tests {
             compat_strict: false,
             request_timeout_secs: crate::DEFAULT_REQUEST_TIMEOUT_SECS,
             reasoning_effort: None,
+            extra_headers: crate::ExtraHeaders::default(),
         };
 
         let err = match build_provider(cfg) {

@@ -34,9 +34,11 @@ path (docker + Claude Code). This page covers everything else:
 The Docker image is published for `linux/amd64` and `linux/arm64`; Apple
 Silicon Macs and ARM64 Linux hosts should not need `--platform linux/amd64`.
 
-> **Podman.** The `bin/ai-memory` wrapper works with rootless podman, either
-> through the `podman-docker` `docker` shim or by pointing it at podman
-> directly with `AI_MEMORY_DOCKER=podman`. See
+> **Podman.** The `bin/ai-memory` wrapper automatically uses rootless Podman
+> when Docker is not installed. It also works through the `podman-docker`
+> `docker` shim; set `AI_MEMORY_DOCKER=podman` to force Podman when both engines
+> are installed. The default image name is fully qualified for non-interactive
+> Podman short-name resolution. See
 > [SELinux-enforcing hosts](#selinux-enforcing-hosts) for how it detects the
 > engine's rootless and SELinux state.
 
@@ -121,6 +123,12 @@ this project"; from the terminal, run `ai-memory install-instructions` (or pass
 legacy long snippets between `<!-- ai-memory:start -->` /
 `<!-- ai-memory:end -->` are replaced in place with the slim snippet, and
 managed Agent Skills are installed or updated alongside it.
+
+If you install into `AGENTS.md` and the project is also used from Claude Code,
+make `CLAUDE.md` import it with a bare `@AGENTS.md` first line. Claude Code
+loads `CLAUDE.md` and does not read `AGENTS.md`, so without that import the
+installed block is absent from context at session start. See
+[Claude Code memory](https://code.claude.com/docs/en/memory#agents-md).
 
 ---
 
@@ -332,6 +340,19 @@ curl -sI http://127.0.0.1:49374/handoff
 
 ### LLM provider login with native services
 
+> **You do not need a paid platform API key.** ai-memory's LLM features
+> (consolidation, lint, auto-improve) are opt-in, and when you enable them you
+> can authenticate with a **subscription you already pay for** instead of a
+> metered API key: a Claude Pro/Max plan via `anthropic-oauth`
+> (`claude setup-token`), a ChatGPT Plus/Pro/Codex plan via `openai-oauth`
+> (`ai-memory auth login openai-oauth`), or a GitHub Copilot plan via `copilot`
+> (`ai-memory auth login copilot`). See
+> [`docs/llm-providers.md`](llm-providers.md) for the full table. And you can
+> skip an LLM entirely: the default zero-LLM path still captures, searches
+> (FTS), and writes rule-based summaries with no provider at all —
+> [`docs/local-embeddings.md`](local-embeddings.md) makes vector search
+> keyless too.
+
 API-key providers go in the relevant env file:
 
 ```bash
@@ -542,19 +563,21 @@ opt-in** — enable the server first, then the client:
 1. **Server:** set `capture_assistant = true` in the live
    `<data_dir>/config.toml` (or the service's configured TOML file), or set
    `AI_MEMORY_CAPTURE_ASSISTANT=true`, then restart `ai-memory serve`.
-2. **Client:** re-install the Claude Code hooks with the flag:
+2. **Client:** re-install the Claude Code (or Codex) hooks with the flag:
 
    ```bash
    ai-memory install-hooks --agent claude-code --capture-assistant --apply
+   # Codex is supported too — its Stop payload carries last_assistant_message:
+   ai-memory install-hooks --agent codex --capture-assistant --apply
    ```
 
 The client sanitizes (built-in patterns) and truncates the excerpt before it
 touches the spool or wire; the server re-scrubs with its `[sanitize]` patterns
 before storing. If either side is off — or the marker is malformed — the Stop
 stays empty. Re-running `install-hooks` without `--capture-assistant` removes
-the flag (idempotent). `--capture-assistant` is Claude Code + native-platform
-only; on any other agent or the script fallback the installer refuses it rather
-than enabling something that cannot take effect. Assistant text is
+the flag (idempotent). `--capture-assistant` is Claude Code and Codex on a
+native hook platform only; on any other agent or the script fallback the
+installer refuses it rather than enabling something that cannot take effect. Assistant text is
 privacy-sensitive — read the `SECURITY.md` notes on what it can contain and where
 it flows (consolidation/reviewer prompts, and out to a cloud LLM provider if one
 is configured) before enabling it.
@@ -572,14 +595,20 @@ agent host, then use that native executable to run
 `install-hooks --agent claude-code --apply`. Even if the script fallback is
 retained, the server still strips any raw field on receipt before persistence.
 
-Native `ai-memory hook --event ...` commands spool events locally. Session start
+Native `ai-memory hook --event ...` commands spool events locally. The POSIX
+shell bundle spools too, but only on failure: it POSTs first and writes the
+event to the same `<data_dir>/hook-spool/` contract when the server is
+unreachable or answers 5xx, then flushes the backlog behind the next delivery
+that succeeds. A 4xx is a permanent rejection and is not retried. (The
+PowerShell bundle still drops an undelivered event.) Session start
 does a short bounded cleanup drain before fetching a handoff; cancellation-prone
 boundary events (`stop`, `pre-compact`, and `session-end`) start a detached
 `hook-drain` helper so delivery does not depend on one shutdown hook surviving.
-Each spooled entry keeps one idempotency key across retries. A server that
-processed an event but lost the batch response will not duplicate its
-observation or completed session-end effects; if processing stopped after the
-observation commit, the retry re-runs downstream work. SessionEnd atomically
+The POSIX bundle assigns one idempotency key before its initial POST and keeps
+that key if the event enters the spool. A server that processed an event but
+lost the response will not duplicate its observation or completed session-end
+effects; if processing stopped after the observation commit, the retry re-runs
+downstream work. SessionEnd atomically
 commits its end watermark with its automatic handoff; a retry that finds that
 transaction complete finishes any interrupted wiki commit, durable provider
 enqueue, and ingest-key completion without adding a second handoff. Those
@@ -735,10 +764,28 @@ docker run --rm akitaonrails/ai-memory:latest \
         --auth-token "$TOKEN"
 ```
 
-Codex still does not expose a reliable true session-end hook. Its `Stop` hook is
-captured as a turn/stop observation only; ai-memory does **not** treat it as
-SessionEnd. When you need the final session summary, handoff, and
-auto-improvement eligibility for the current project, run:
+Native Codex tool hooks use top-level `tool_name`, `tool_input`, `tool_response`,
+and `tool_use_id` fields (verified against CLI 0.154.0). ai-memory records the
+tool family and call ID on `PreToolUse` and `PostToolUse`; recognized tools such
+as `Bash` and `apply_patch` also retain a sanitized response excerpt on
+`PostToolUse`, capped at 2 KB including metadata. Structured JSON responses are
+flattened using the same bounded excerpt path. Inputs are not copied into
+observations, and unknown tools (including unrecognized MCP names) retain only
+metadata. `PostToolUse` alone does not prove success, so Codex outcomes remain
+`unknown`.
+
+Capture exclusions still run before native spooling. Codex's `apply_patch`
+passes patch text in `tool_input.command`, which does not provide direct file
+paths to the capture policy. With active `ignore_paths`, those events retain
+only metadata; ai-memory does not parse patch or shell text to infer paths.
+Tool events are delivered at the normal 32-event catch-up threshold or a
+lifecycle drain boundary, so a small active turn may still have queued events.
+
+Codex CLI 0.145.0 and later expose a native `SessionEnd` hook. `Stop` is captured
+as a turn boundary and leaves the session open; a native `SessionEnd` triggers
+the final summary, handoff, and auto-improvement eligibility. See the
+[Codex hook lifecycle](https://learn.chatgpt.com/docs/hooks#sessionend) for when
+Codex ends a session. For older clients or a missed session-end delivery, run:
 
 ```bash
 ai-memory finalize-session
@@ -826,7 +873,8 @@ successful calls; it reuses the post-tool-use handler), `Stop`,
 native `ai-memory hook --event … --agent kimi-code` commands on local installs
 (local spool plus batched delivery, capture-policy v1 enforced); the staged
 script bundle under `~/.local/share/ai-memory/hooks/kimi-code/` is the
-compatibility fallback (fire-and-forget POSTs to `/hook`). A pending handoff
+compatibility fallback (POSTs to `/hook`, spooling a failed delivery for a
+later drain, without capture-policy v1 enforcement). A pending handoff
 is injected at `UserPromptSubmit` through the hook's stdout, which Kimi Code
 appends to the model context as a user message before the turn; Kimi Code
 fires `SessionStart` but discards that hook's stdout, so hooks installed by
@@ -1110,6 +1158,51 @@ docker run --rm akitaonrails/ai-memory:latest \
 Restart OpenCode after installing or changing the plugin; plugins are
 loaded at startup.
 
+### OpenCode 2 (beta)
+
+The 2.0 beta installs side by side as `opencode2` and shares v1's config
+dir and session store, but its MCP schema and plugin API changed. Wire it
+with the `opencode2` client/agent names:
+
+```bash
+docker run --rm akitaonrails/ai-memory:latest \
+    install-mcp --client opencode2 \
+    --server-url "http://homelab:49374/mcp" \
+    --auth-token "$TOKEN"
+
+# Plugin — write to ~/.config/opencode/plugins/ai-memory-opencode2.ts.
+# If you have the local wrapper installed, prefer `--apply`:
+ai-memory install-hooks --agent opencode2 --apply \
+    --server-url "http://homelab:49374" \
+    --auth-token "$TOKEN"
+```
+
+V2 nests servers under `mcp.servers` (no `enabled` field), so the v1
+(`mcp`) and v2 (`mcp.servers`) entries coexist in the one
+`~/.config/opencode/opencode.json(c)` file — the beta explicitly supports
+this mixed nesting, so keep both entries and do not "convert" the file by
+removing the v1 one
+(see [Migrate from V1](https://opencode.ai/v2/docs/migrate-v1)). `ai-memory run opencode2`
+resumes the same native sessions as `ai-memory run opencode` through the
+`opencode2` binary. Both plugins share the one auto-loaded dir while the
+beta is side-by-side; a host may warn about its sibling's file (the two
+plugin APIs are incompatible) — that warning is benign, and `uninstall`
+removes each file only on its own ownership markers.
+
+> **Back up `~/.local/share/opencode` before running the beta against
+> your real data.** The two binaries share the one `opencode.db` file and
+> the beta has migrated its schema in place before, leaving stable
+> `opencode` 1.x broken
+> ([upstream #42260](https://github.com/anomalyco/opencode/issues/42260)).
+> ai-memory only ever opens that database read-only; the migration risk
+> comes from launching `opencode2` itself, not from this integration.
+>
+> **The beta's background service defaults to port 49374 — ai-memory's own
+> default.** Running both on defaults crash-loops the opencode2 service
+> (`Managed service port 49374 ... is already in use`). Move one side:
+> `opencode2 service set port <free-port>`, or start ai-memory with
+> `--bind 127.0.0.1:<free-port>` (and matching `--server-url` installs).
+
 **On a Gemini/Vertex model, serve Gemini-safe schemas.** OpenCode forwards MCP
 tool schemas to the configured provider verbatim, and Google's `Schema`
 (Vertex/Gemini `functionDeclaration.parameters`) accepts only a single `type` per
@@ -1347,7 +1440,7 @@ docker run --rm akitaonrails/ai-memory:latest \
 ```
 
 The curl script installer supports
-`--agent claude-code|codex|cursor|gemini-cli|antigravity-cli|grok|opencode|openclaw|omp|oh-my-pi|pi`
+`--agent claude-code|codex|cursor|gemini-cli|antigravity-cli|grok|opencode|opencode2|openclaw|omp|oh-my-pi|pi`
 and `--to <dir>`; `--help` prints the full flag list. OpenCode,
 OpenClaw, OMP / Oh My Pi, and Pi do not need script extraction because
 `install-hooks` generates TypeScript plugin/extension files for them
@@ -1483,6 +1576,7 @@ ai-memory works in three intensity tiers:
 | **+ LLM consolidation** | LLM rewrites session pages as coherent narratives; PreCompact checkpoints; LLM-driven contradiction lint | `AI_MEMORY_LLM_PROVIDER=anthropic` + `ANTHROPIC_API_KEY` | ~$0.01–0.05 / session |
 | **+ Anthropic via subscription** | Same LLM features using a Claude Pro/Max subscription instead of an API key | `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` + `ANTHROPIC_OAUTH_TOKEN` | Uses your Claude subscription |
 | **+ ChatGPT/Codex OAuth** | Same LLM features using a ChatGPT Pro/Plus login instead of an OpenAI Platform key | `AI_MEMORY_LLM_PROVIDER=openai-oauth` + `ai-memory auth login openai-oauth` | Uses your ChatGPT subscription |
+| **+ Codex credential reuse** | Same LLM features using the Codex CLI-owned login without copying or owning its refresh token | `AI_MEMORY_LLM_PROVIDER=codex` + an authenticated Codex CLI | Uses your ChatGPT subscription |
 | **+ GitHub Copilot** | Same LLM features using a GitHub Copilot subscription | `AI_MEMORY_LLM_PROVIDER=copilot` + `ai-memory auth login copilot` or `COPILOT_GITHUB_TOKEN` | Uses your Copilot subscription |
 | **+ LLM reranking** | At most one relevance pass over up to 30 bounded project/scopes search candidates; normal order is preserved on invalid, failed, timed-out, or concurrency-saturated responses | `AI_MEMORY_RERANKER=llm` + any configured LLM provider | One LLM call per eligible query, at most four concurrently |
 | **+ Hybrid retrieval** | Adds vector cosine similarity to FTS5 + entity + graph RRF. Better recall on paraphrased queries | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `OPENAI_API_KEY` (or `EMBEDDING_API_KEY`) | ~$0.0001 / page on backfill |
@@ -1497,15 +1591,17 @@ If you set only the provider, ai-memory picks a sensible default:
 | `AI_MEMORY_LLM_PROVIDER=anthropic-oauth` | `claude-sonnet-4-6` | Anthropic via Claude subscription. Run `claude setup-token` once; set `ANTHROPIC_OAUTH_TOKEN` (or `CLAUDE_CODE_OAUTH_TOKEN`). No `ANTHROPIC_API_KEY` needed. Same `/v1/messages` endpoint, Bearer token auth. |
 | `AI_MEMORY_LLM_PROVIDER=openai` | `gpt-5.4-mini` | Cheaper + faster alternative. Same parse reliability; mild over-classification on thin sessions. |
 | `AI_MEMORY_LLM_PROVIDER=openai-oauth` | `gpt-5.5` | ChatGPT/Codex backend. Run `ai-memory auth login openai-oauth` once; ai-memory stores the refresh token in `<data_dir>/auth.json` and refreshes access tokens automatically. Optional `AI_MEMORY_LLM_REASONING_EFFORT` (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`/`persistent`) is mapped to each provider's native reasoning field; omit it to keep the model default. |
+| `AI_MEMORY_LLM_PROVIDER=codex` | `gpt-5.6-luna` | Reuses only `access_token` and `account_id` from Codex's `auth.json`; token renewal is delegated to `codex app-server --stdio`. |
 | `AI_MEMORY_LLM_PROVIDER=copilot` | `gpt-5.5` | GitHub Copilot Chat backend. ai-memory stores a GitHub user token in `<data_dir>/auth.json`, exchanges it for a short-lived Copilot API token, and refreshes before expiry. |
 | `AI_MEMORY_LLM_PROVIDER=gemini` | `gemini-3.5-flash` | Google's hosted option with a generous free tier. ai-memory disables Gemini 3.5 Flash's default dynamic thinking so hidden thought tokens do not truncate strict JSON. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
-| `AI_MEMORY_LLM_PROVIDER=opencode` | `claude-sonnet-4-6` | [OpenCode Zen/Go](https://opencode.ai) cloud API at the OpenAI-compatible `opencode.ai/zen/go/v1` endpoint. Requests identify ai-memory by version and reuse one session header across related attempts. Set `OPENCODE_API_KEY` (key from `opencode.ai/auth`). Alias: `opencode-zen`. |
+| `AI_MEMORY_LLM_PROVIDER=opencode` | `claude-sonnet-4-6` | [OpenCode](https://opencode.ai) cloud API. Defaults to the **Go** endpoint, `opencode.ai/zen/go/v1` — a cost-optimised model subset. GPT-5.6 Luna uses Go's Responses endpoint; other models use Chat Completions. For **Zen**'s full catalogue, set `AI_MEMORY_LLM_BASE_URL=https://opencode.ai/zen/v1` plus an `AI_MEMORY_LLM_MODEL` from it; the default model id is Go's. Requests identify ai-memory by version and reuse one session header across related attempts. Both endpoints take `OPENCODE_API_KEY` (key from `opencode.ai/auth`). Alias: `opencode-zen` — historical, and it selects Go like the others; the endpoint is chosen by the base URL, not the alias. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` | `text-embedding-3-small` (1536-dim) | 5× cheaper than `-3-large` with marginal recall loss. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1` | `openai/text-embedding-3-small` via [OpenRouter](https://openrouter.ai) | Uses `EMBEDDING_API_KEY`, else reuses `LLM_API_KEY` or `OPENAI_API_KEY`, with the OpenAI-compatible embedding client. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai` + `AI_MEMORY_EMBEDDING_BASE_URL=https://api.orcarouter.ai/v1` | `openai/text-embedding-3-small` via [OrcaRouter](https://www.orcarouter.ai) | Uses `EMBEDDING_API_KEY`, else reuses `LLM_API_KEY`, with the OpenAI-compatible embedding client. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=voyage` | `voyage-3` (1024-dim) | Voyage's current general-purpose recommendation. |
 | `AI_MEMORY_EMBEDDING_PROVIDER=google` / `gemini` | `gemini-embedding-001` (768-dim) | Google-hosted embeddings via `embedContent`. Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
 | `AI_MEMORY_EMBEDDING_PROVIDER=openai-compat` | no default — set model, dim, and base URL explicitly | Self-hosted engines (Ollama, LM Studio, vLLM). Keyless by default; `EMBEDDING_API_KEY`, else `LLM_API_KEY`, is sent as a bearer token when present (gateways). Example: `AI_MEMORY_EMBEDDING_BASE_URL=http://localhost:11434/v1`, `AI_MEMORY_EMBEDDING_MODEL=nomic-embed-text`, `AI_MEMORY_EMBEDDING_DIM=768`. Switching an existing `openai`+base-URL setup to `openai-compat` changes the stored `{provider, model, dim}` triple — run `ai-memory embed --force` to re-embed. |
+| `AI_MEMORY_EMBEDDING_PROVIDER=copilot` | `text-embedding-3-small` (1536-dim) | Reuses the `copilot` LLM provider's OAuth login (`ai-memory auth login copilot`, `COPILOT_GITHUB_TOKEN`, or `GITHUB_COPILOT_API_TOKEN`) — no separate API key. Calls Copilot's `/embeddings` endpoint following the OpenAI-compatible contract Copilot documents for chat; that endpoint's exact shape is not covered by a live test against Copilot here, so treat it as needing a real-Copilot smoke test. |
 
 > **What we don't recommend:** reasoning-mode models (Claude with extended
 > thinking, GPT-o3, Gemini "thinking" variants) — they burn token budget on
@@ -1643,6 +1739,29 @@ Use `ai-memory auth status` to check whether a token is present and
 > do not eat the JSON budget. Reserve high-effort reasoning for your
 > coding agent.
 
+### Codex credential reuse
+
+The independent `codex` provider reads `$CODEX_HOME/auth.json`, falling back to
+the platform home's `.codex/auth.json`. It materializes only
+`tokens.access_token` and `tokens.account_id`, reloads them before every call,
+and never copies or writes the file. On the first 401, it asks
+`codex app-server --stdio` to refresh the Codex-owned credential and retries
+the Responses request once.
+
+```bash
+export AI_MEMORY_LLM_PROVIDER=codex
+export AI_MEMORY_LLM_MODEL=gpt-5.6-luna
+export AI_MEMORY_LLM_REASONING_EFFORT=medium
+ai-memory llm-test --provider codex --model gpt-5.6-luna --prompt "Reply with OK"
+ai-memory llm-test --provider codex --model gpt-5.6-luna --structured --prompt "Return a short answer"
+```
+
+`AI_MEMORY_CODEX_EXECUTABLE` optionally selects another Codex binary. File
+storage is supported; `auto` is supported when it resolves to the same
+`auth.json`. Keyring-only and ephemeral storage are not supported. Docker is
+outside the automatic setup path: both the executable and credentials must be
+available inside the same container/environment.
+
 ### GitHub Copilot
 
 `copilot` uses a GitHub user token, then exchanges it for a short-lived Copilot
@@ -1761,6 +1880,32 @@ ceiling to match the gateway's worst-case generation time:
 ```bash
 -e AI_MEMORY_LLM_TIMEOUT_SECS=900
 ```
+
+#### Send a caller-identifying header to a gateway that requires one
+
+Every chat request already carries `User-Agent: ai-memory/<version>`, so a
+gateway can tell what is calling it. Some also require a header of their own
+for request correlation, and reject or throttle traffic without it. Declare
+those once — they are sent on every chat request, whatever the provider:
+
+```bash
+-e AI_MEMORY_LLM_HEADERS=x-opencode-session=prod-01,x-opencode-client=ai-memory
+```
+
+Entries are `Name=Value` or `Name: Value`, comma separated. A header *value*
+cannot contain a comma through the env var; use `llm_headers = [...]` in
+`config.toml` when one must. Headers ai-memory sets itself (`authorization`,
+`content-type`, `x-api-key`, `x-goog-api-key`, `anthropic-version`,
+`anthropic-beta`, `openai-beta`, `host`, `content-length`) are refused at
+startup rather than duplicated onto the request. An entry for `user-agent`
+overrides the default. Values are never logged.
+
+The `opencode` provider needs no configuration for this: OpenCode asks
+callers for `x-opencode-session`, and that provider already sends one id per
+logical operation — stable across retries and the structured-output
+fallback, so one consolidation pass reads as one operation in OpenCode's
+metrics. Supply the header through `AI_MEMORY_LLM_HEADERS` to override that,
+for instance to tell several ai-memory instances apart under one account.
 
 #### Match the consolidation budget to a local model's context window
 
@@ -2231,7 +2376,28 @@ the wrapper requires `<url>.sha256` unless
 
 When the upgraded server starts, it applies SQLite schema migrations and
 pending wiki-structure migrations automatically. No manual database
-reset or wiki rewrite is required for normal upgrades.
+reset or wiki rewrite is required for normal upgrades. Migrations are
+forward-only: after a newer version has applied its schema, an older binary
+will refuse to open that data dir (it fails closed rather than risk
+corruption), so take a `ai-memory backup` before upgrading if you might need
+to roll back to the previous version.
+
+### Upgrading to 2.3.0
+
+2.3.0 is a normal forward upgrade (the only new migration, `V64`, just adds the
+cross-project `agent_messages` table — nothing existing is altered or removed).
+Two capture/UX conveniences are **on by default**; both are additive and
+non-destructive, but worth knowing about for your first session after upgrading:
+
+- **First `ai-memory run <harness>` auto-installs that harness's hooks + MCP** if
+  they were not already wired (idempotent, one-time per harness; it preserves
+  your existing hook config, including a `--capture-assistant` opt-in). Disable
+  with `ai-memory run --no-autowire` or `AI_MEMORY_RUN_AUTOWIRE=false`.
+- **The first session in a brand-new (empty) project imports that project's
+  existing local harness history once**, so installing ai-memory mid-project is
+  not amnesiac. It only ever runs on an empty project (never touches one that
+  already has captured memory) and is hard-capped. Disable with
+  `AI_MEMORY_BACKFILL_ON_START=false`; run it by hand with `ai-memory backfill`.
 
 If the server runs on another host, `ai-memory upgrade` refreshes only
 the local wrapper, local image, and local hook scripts. Redeploy the

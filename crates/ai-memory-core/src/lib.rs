@@ -12,6 +12,7 @@ pub mod handoff;
 pub mod ingest_metrics;
 pub use ingest_metrics::{IngestMetrics, IngestMetricsSnapshot};
 pub mod ids;
+pub mod message;
 pub mod observation;
 pub mod okf;
 pub mod page;
@@ -56,15 +57,23 @@ pub use handoff::{
 };
 pub use ids::{
     AgentKind, ApiCredentialId, AutoImproveProposalId, AutoImproveRunId, EntityId, HandoffId,
-    ManagedRunId, ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId, UserId,
-    WorkspaceId, WorkstreamId,
+    ManagedRunId, MessageId, ObservationId, PageFeedbackId, PageId, PagePath, ProjectId, SessionId,
+    UserId, WorkspaceId, WorkstreamId, is_git_reserved_component, portable_page_key,
+};
+pub use message::{
+    AgentMessage, MessageBox, MessageClaim, MessageOrigin, MessageState, NewAgentMessage,
+    UNTRUSTED_MESSAGE_NOTICE,
 };
 pub use observation::{NewObservation, NewSession, Observation, ObservationKind};
 pub use page::{
-    FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page, Relation, Tier,
-    frontmatter_entity_names, normalize_entities, normalize_entity,
+    FeedbackKind, LinkTarget, MAX_ENTITIES_PER_PAGE, MAX_ENTITY_LEN, NewPage, Page, PageEvidence,
+    PageEvidenceKind, Relation, Tier, frontmatter_entity_names, normalize_entities,
+    normalize_entity,
 };
-pub use routing_snippet::{MARKER_END, MARKER_START, SNIPPET_BODY, find_marker_line, full_block};
+pub use routing_snippet::{
+    COMPACT_SNIPPET_BODY, MARKER_END, MARKER_START, SNIPPET_BODY, compact_block, find_marker_line,
+    full_block,
+};
 pub use sanitize::{
     OBSERVATION_BODY_MAX_BYTES, SanitizeConfig, Sanitized, Sanitizer, truncate_utf8_bytes,
     truncate_utf8_bytes_head_tail,

@@ -1,11 +1,52 @@
 # Managed cross-harness workstreams
 
 `ai-memory run` is an opt-in launcher that lets one logical coding session move
-between Claude Code, Codex, OpenCode, Pi, Crush, Kimi Code, Command Code, Kiro
+between Claude Code, Codex, OpenCode, OpenCode 2 beta, Pi, Crush, Kimi Code, Command Code, Kiro
 CLI v2/v3, OMP, Grok Build CLI, and Antigravity CLI. Direct agent launches
 keep their existing ai-memory behavior. There is no global mode toggle and no
 `switch` command: using `run` selects the current workstream and transparently
 creates or resumes the correct native session for the requested harness.
+
+**`ai-memory run` is the preferred way to start a harness — "if in doubt, run
+with ai-memory."** Beyond session continuity, the first time it launches a given
+harness it **auto-installs that harness's ai-memory hooks and MCP** if they are
+not already wired, so capture and recall work without a separate `install-hooks`
+/ `install-mcp` step (a common footgun: `ai-memory run kimi` used to capture
+nothing if the Kimi hooks were never installed). Auto-wire is idempotent and
+one-time per harness + binary version, preserves unrelated user config, runs
+before the harness starts so it picks up the fresh hooks, and is best-effort —
+if an install fails it warns and still launches. Harnesses without installer
+support (Crush) are skipped; Pi wires hooks but has no MCP client to write. Turn
+it off with `ai-memory run --no-autowire`, `AI_MEMORY_RUN_AUTOWIRE=false`, or
+`run_autowire = false` in config; manual `install-hooks` / `install-mcp` remain
+available for harnesses you never launch through `run`.
+
+The launcher resolves its executable name through `PATH` directly — it does
+not go through an interactive shell, so a `claude` defined only as a shell
+`alias` in `.bashrc`/`.zshrc` is invisible to it. If you switch Claude
+accounts by alias, put a same-named script or shim earlier on `PATH` instead
+(or pass `--executable PATH`, which also resolves a bare name through
+`PATH`), so the resolved `claude` process actually is the one you meant.
+
+**Multiple Claude accounts (e.g. Corporate and Personal).** Any harness name
+starting with `claude` is accepted (`claude-corp`, `claude-personal`, ...)
+and always selects the Claude harness — the exact spelling never changes
+the agent kind, session store, or transcript import.
+Combine that wildcard with `--executable` to launch the right account's
+binary while keeping each account's managed workstream distinguishable in
+your shell history:
+
+```bash
+# ~/bin/claude-corp and ~/bin/claude-personal are wrapper scripts (earlier on
+# PATH than the bare `claude`) that each exec the real claude binary with
+# that account's config/credentials directory.
+ai-memory run claude-corp --executable claude-corp --model opus
+ai-memory run claude-personal --executable claude-personal
+```
+
+Only the `--executable` value matters for which binary actually runs; the
+positional name is free-form as long as it starts with `claude`, so pick
+whatever reads clearly to you.
 
 ```bash
 cd /path/to/project
@@ -15,6 +56,8 @@ ai-memory run claude
 ai-memory run codex --yolo
 # return to Claude Code later; ai-memory supplies Claude's native --resume
 ai-memory run claude --model opus
+# any `claude*` name is accepted (see "Multiple Claude accounts" above)
+ai-memory run claude-corp
 # Kimi Code installs `kimi`; `kimi-cli` is accepted as a launcher alias
 ai-memory run kimi-cli
 # Command Code uses `command-code` on Unix and `cmdc` on native Windows
@@ -42,7 +85,7 @@ file, and the current checkout remain authoritative.
 ai-memory run [--workspace NAME] [--project NAME]
               [--workstream NAME | --new NAME] [--executable PATH]
               [--yolo] [--fresh]
-              [claude|codex|opencode|pi|crush|omp|kimi|command-code|kiro|grok|antigravity]
+              [claude|claude*|codex|opencode|opencode2|pi|crush|omp|kimi|command-code|kiro|grok|antigravity]
               [native arguments...]
 ```
 
@@ -211,7 +254,20 @@ has a usable local session. It never chooses a newer but obsolete session from
 another harness merely because that file has a later timestamp. Kiro's v2 and
 v3 candidates share one server agent identity, but the selected native engine
 flavor remains exact. OMP, Grok, and Antigravity remain available explicitly
-but are not in the automatic pool.
+but are not in the automatic pool. OpenCode 2 is likewise explicit-only
+(`ai-memory run opencode2`): it shares v1's session store, so listing both
+would duplicate every candidate.
+
+OpenCode 2 sessions run inside a shared background service, so its plugin
+cannot see a managed run's environment the way in-process plugins do. Managed
+`run opencode2` legs launch with the correct resume selectors, capture through
+hooks, and import the beta transcript — all verified live — but the
+ledger-delta acknowledgement (`context_delivered`) does not fire, because the
+accept path requires the run id on the session-start hook. The failure mode is
+redelivery, never loss: a later leg into another harness may receive the range
+again. Until the beta offers per-invocation plugin context, cross-harness
+continuity into opencode2 arrives through the ordinary handoff loop rather
+than the ledger delta.
 
 Bare mode accepts wrapper options but not harness-native arguments or
 `--executable`, because their meaning depends on the selected harness. In a new
@@ -309,6 +365,7 @@ is labelled completed evidence and must never be replayed as a pending call.
 | Claude Code | generated `--session-id` | `--resume <id>` | `~/.claude/projects/**/*.jsonl` |
 | Codex | native default creation | `resume <id>` | `~/.codex/sessions/**/rollout-*.jsonl` |
 | OpenCode | native default creation | `--session <id>` | `~/.local/share/opencode/opencode.db` opened read-only |
+| OpenCode 2 beta | native default creation | `--session <id>` | same `opencode.db` as v1 (the beta channel keeps v1's filename; the beta adds `session_v2`/`session_message` tables beside v1's); launched via the `opencode2` binary |
 | Pi | generated `--session-id` | `--session <id>` | `~/.pi/agent/sessions/**/*.jsonl` |
 | Crush | native default creation | `--session <id>` | `<project>/.crush/crush.db` opened read-only |
 | Kimi Code | native default creation | `--session <id>` | `$KIMI_CODE_HOME/sessions/*/*/agents/main/wire.jsonl` |
@@ -518,6 +575,13 @@ previous launcher can finish; if another harness is genuinely still running,
 the conflict remains and concurrent writers are still rejected. Terminal
 interrupts continue to reach the child while the parent stays alive to finish
 or cancel the run.
+
+Before the child starts, `Ctrl+C` at the native-session chooser cancels the
+acquired run and exits without requiring Enter or adopting the selected session.
+The launcher waits for the server's cancellation response. A request error is
+reported and leaves the lease to expire within its normal 90-second window;
+a server that accepts the request but never responds can still keep the launcher
+waiting. Heartbeats have stopped, so the lease itself still expires.
 
 While the harness or native-session selector is open, a temporary server outage
 produces one short notice instead of printing every failed heartbeat. The

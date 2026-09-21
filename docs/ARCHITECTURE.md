@@ -82,8 +82,9 @@ from hook paths.
    converge. Existing ended sessions are baselined at migration instead of
    becoming historical catch-up work. Auto-commits the wiki. Clients
    without a reliable true session-end hook need an explicit ending action:
-   use `ai-memory finalize-session` for Codex, or
-   `ai-memory finalize-session --agent antigravity-cli` for Antigravity CLI.
+   `ai-memory finalize-session --agent antigravity-cli` for Antigravity CLI
+   (Codex has a native `SessionEnd` since CLI 0.145.0; `finalize-session
+   --agent codex` is only the fallback on older Codex).
    The command selects the latest matching open session and enters the same
    canonical SessionEnd path as a native hook. Generated session-page
    frontmatter records `session_id` plus the immutable `sessions.agent_kind`
@@ -285,6 +286,8 @@ separately gated Claude Code assistant/Stop excerpt remains capped at 2 KB.
 | `page_embeddings` | Optional vector rows for latest pages, with `(provider, model, dim)` denormalised so hybrid search can ignore stale vectors after an embedding config change and report missing-embedding diagnostics. |
 | `page_feedback` | Append-only `memory_feedback` signals (`helpful` / `not_helpful` / `stale` / `wrong`) keyed by page *version*, with an optional sanitized reason and `salience_after`. Source of truth for the derived `pages.salience`; the lint pass reads unresolved stale/wrong rows joined against `is_latest = 1`, so a rewrite retires the finding. |
 | `page_access` | One row per latest page and qualified operator identity. Supplies the optional access-breadth retention term without changing the existing shared access counter. |
+| `page_evidence` | V63 append-only record of what produced or reaffirmed each page version — consolidation cites the `session` it ran on, written in the page-upsert transaction and cascaded on purge. Surfaced as `evidence_count` in `memory_query(explain=true)` and used to order the opt-in `settled_first` briefing. Ranking-inert: the confidence→authority factor is deferred behind the eval harness (`docs/design-hindsight-borrowings.md` P2). |
+| `agent_messages` | V64 cross-project message inbox/queue (`docs/agent-messaging.md`). Directed, claim-once mail from a sender coordinate to a recipient coordinate; `pending`→`claimed` (popped exactly once, the handoff compare-and-set) or `pending`→`cancelled` (sender retracts). The one table that crosses per-project isolation, so reads are keyed by the recipient coordinate (inbox) or sender coordinate (outbox); `from_owner_user`/`claimed_by_user` are attribution only, never a read filter. Recipient inbox depth is capped. `ON DELETE CASCADE` on both coordinate pairs. |
 | `client_activity` | Server-wide MCP tool-call counters split into reads/writes and bucketed by UTC day. The MCP request choke point flushes buffered calls on a one-minute background interval; failed batches retry from bounded memory. Each day stores at most 128 sanitized client labels plus `other`, so an untrusted `clientInfo.name` cannot create traffic-proportional rows. |
 | `auto_improve_proposals` | Staged learning and maintenance edits with immutable target snapshots and append-only decision events. Pending-target uniqueness is scoped by the qualified staging identity; unattributed proposals retain the historical shared bucket. |
 | `entities`, `entity_page_links` | V38 noun index derived from canonical frontmatter. Names are normalized and unique per project; links target immutable page versions while retrieval filters to the latest version. Scope-pairing triggers prevent cross-project links. Powers the fourth RRF retrieval stream. |
@@ -362,28 +365,33 @@ Each crate has a single responsibility and exposes a typed API. No
 circular deps. Inter-crate boundaries enforce the cross-cutting
 invariants below.
 
-## MCP tool surface (18 tools)
+## MCP tool surface (23 tools)
 
 | Tool | Hint | Purpose |
 |---|---|---|
-| `memory_query` | read-only | FTS5 + entity-match + graph RRF + optional vector RRF search, followed by bounded kind/tier/pinned/tag authority adjustment and raw fallback. Bumps access counters for page hits. Defaults to the current project; default-scoped calls also union the reserved `_global` preferences scope as `global_scope_hits`; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). With `AI_MEMORY_RERANKER=llm`, project/scopes candidate pools are fused before at most one final LLM relevance pass; query/title/snippet data is bounded and JSON-encoded, and any timeout, provider error, invalid/incomplete score set, or four-call concurrency saturation preserves the adjusted order. The distinct `global=true` FTS-only ranker and supplemental global-preference hits are not reranked. `explain=true` attaches per-hit `score_details` (per-stream ranks, matched entities, raw FTS/cosine/entity inverse-frequency scores, RRF contributions, graph provenance, authority multiplier, and optional rerank score) to project/scopes hits plus a top-level `streams_active` list. The global FTS-only ranker reports its active stream without per-hit details. `include_expired=true` also returns TTL-expired pages. |
+| `memory_query` | read-only | FTS5 + entity-match + graph RRF + optional vector RRF search, followed by bounded kind/tier/pinned/tag authority adjustment and raw fallback. Bumps access counters for page hits. Defaults to the current project; default-scoped calls also union the reserved `_global` preferences scope as `global_scope_hits`; `scopes` searches named sibling projects; `global=true` searches every project at once (each hit annotated with its workspace + project). With `AI_MEMORY_RERANKER=llm`, project/scopes candidate pools are fused before at most one final LLM relevance pass; query/title/snippet data is bounded and JSON-encoded, and any timeout, provider error, invalid/incomplete score set, or four-call concurrency saturation preserves the adjusted order. The distinct `global=true` FTS-only ranker and supplemental global-preference hits are not reranked. `explain=true` attaches per-hit `score_details` (per-stream ranks, matched entities, raw FTS/cosine/entity inverse-frequency scores, RRF contributions, graph provenance including the typed edge kind (`causes`/`fixes`/`contradicts`) a neighbour was reached by, the page's evidence count, authority multiplier, and optional rerank score) to project/scopes hits plus a top-level `streams_active` list. The global FTS-only ranker reports its active stream without per-hit details. `include_expired=true` also returns TTL-expired pages. |
 | `memory_recent` | read-only | Most-recently-updated `is_latest=1` pages. |
 | `memory_read_page` | read-only | Fetch the FULL body of a single wiki page by `path` or by top FTS5 hit for a `query`; optional `workspace` + `project` targets a named sibling workspace/project. Use when an agent needs more than the 24-word snippets from `memory_query`. |
 | `memory_read_session_observations` | read-only | Page through ONE session's raw hook observations (`ObservationRecord` with full sanitized body, capped per row by `body_max_chars`), restricted to the rows that landed in the resolved scope and to sessions the caller may see; `total` and `elided_other_scope` report the in-scope count and the rows the session left in another project. `session_id` omitted reads the latest completed visible session. |
 | `memory_status` | read-only | Counts, paths, version. |
-| `memory_briefing` | read-only | Structured counts/activity/rules/slots/recent snapshot. |
+| `memory_briefing` | read-only | Structured counts/activity/rules/slots/recent snapshot. Opt-in `settled_first: true` leads with up to 8 of the project's highest-standing `rule`/`decision` pages, ordered by evidence count then recency; off by default. |
 | `memory_explore` | read-only | LLM prose digest over the briefing snapshot, degrading to JSON without a provider. |
 | `memory_handoff_begin` | destructive | Open an owner-scoped handoff for the next agent; `shared=true` deliberately publishes it to the project. Optional `workspace` + `project` targets a named sibling workspace/project. |
-| `memory_handoff_accept` | destructive | Fetch + ack the latest own/shared handoff (automatic handoffs are cwd-matched). Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. |
+| `memory_handoff_list` | read-only | List open own/shared handoffs with inspectable body and identity fields; does not claim or expire. Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. |
+| `memory_handoff_accept` | destructive | Fetch + ack an open own/shared handoff. Pass `handoff_id` from `memory_handoff_list` to claim that exact row; omitting it still claims the latest eligible open handoff (automatic handoffs are cwd-matched). Root-only `any_owner=true` recovers across operators. Optional `workspace` + `project` targets a named sibling workspace/project. |
 | `memory_handoff_cancel` | destructive | Mark an exact visible open handoff id expired when it was created by mistake; root-only `any_owner=true` recovers across operators. |
+| `memory_message_send` | destructive | Send a directed cross-project message into another project's inbox (V64). Requires `to_workspace` + `to_project`; the recipient must already exist (fail-closed, never created). Body is secret-scrubbed and size-capped. The one tool that crosses project isolation on purpose. |
+| `memory_message_list` | read-only | List pending mail for this project — `box="inbox"` (poppable, default) or `box="outbox"` (cancellable). Bodies are untrusted cross-project input. |
+| `memory_message_pop` | destructive | Claim ONE inbox message exactly once (oldest, or a specific `message_id`); returns it fenced as untrusted input with sender provenance, or `null` when empty. |
+| `memory_message_cancel` | destructive | Retract a pending sent message by `message_id`, or clear the whole outbox when omitted. Scoped to the sender project. |
 
-`memory_handoff_cancel` needs an exact id. `ai-memory handoffs` lists the open
+`memory_handoff_list` is the inspect-without-claim path for clients that cannot inject SessionStart stdout. `memory_handoff_cancel` needs an exact id. `ai-memory handoffs` lists the open
 handoffs for a project, oldest first, with their ids — read-only, and
 content-free (identity, provenance and age, never the summary body). Automatic
 expiry deliberately spares manual and sibling-directory handoffs, so a
 long-lived entry appearing there is that policy working rather than a fault.
 
-| `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out. Consolidation prompts append the target project's active reserved `_prompts/consolidation.md` body as sanitized, 2,000-character-capped, JSON-encoded, untrusted advisory preferences; TTL-expired pages are ignored and a per-call `instructions` argument overrides the page for one call. Both system prompts keep schema, evidence, disclosure, tool-use, and output rules authoritative. |
+| `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out. Omitting `session_id` (or sending a blank one) consolidates the latest completed session in the resolved project; the same omission on a project with none fails as `no completed session in <scope>`. Consolidation prompts append the target project's active reserved `_prompts/consolidation.md` body as sanitized, 2,000-character-capped, JSON-encoded, untrusted advisory preferences; TTL-expired pages are ignored and a per-call `instructions` argument overrides the page for one call. Both system prompts keep schema, evidence, disclosure, tool-use, and output rules authoritative. |
 | `memory_feedback` | write | Record a quality signal for one page by exact `path`: `helpful`/`not_helpful` step `pages.salience` for sweep-eligible episodic pages, while `stale`/`wrong` floor salience and surface any current page as a `feedback_flagged` lint finding. Never deletes; the path resolves to the current version in the transaction, so a later rewrite clears it. Retrieved content never authorizes feedback by itself. |
 | `memory_auto_improve` | write | Manually review a completed session and apply or stage validated wiki edits through the auto-improvement approval path. Without a session ID, selects the newest completed session with no persisted auto-improvement run so repeated calls advance through preflight skips; an explicit ID remains rerunnable. The server also schedules review for new sessions; `[auto_improve] require_approval = true` leaves proposals pending for manual review. |
 | `memory_write_page` | destructive | Write durable wiki knowledge when the user explicitly asks to remember/annotate it. `scope: "global"` writes into the reserved `_global` preferences scope; optional `expires_at` sets an RFC3339 or date-only TTL. |
@@ -475,7 +483,8 @@ reorg                purge-project        rename-project
 move-project         move-session         uninstall
 auth                 user                 completions
 handoffs             purge-session        compact
-api-key              export-okf
+api-key              export-okf           message
+doctor               backfill
 ```
 
 Run `ai-memory --help` for the full tree.
@@ -541,6 +550,22 @@ prefixed `AI_MEMORY_*`.
 bind = "127.0.0.1:49374"
 log_level = "info"
 
+# Capture / launch UX (all default-on where noted). Each has an AI_MEMORY_* env
+# override (AI_MEMORY_CAPTURE_ASSISTANT / AI_MEMORY_BACKFILL_ON_START /
+# AI_MEMORY_RUN_AUTOWIRE).
+capture_assistant = false          # server-side opt-in: honor a Claude Code / Codex
+                                   # client's sanitized assistant-final-message marker
+                                   # on Stop (#196). Client half is baked separately by
+                                   # `install-hooks --capture-assistant`.
+backfill_on_start = true           # on first SessionStart in a brand-new (empty) project,
+                                   # import that project's existing local harness history
+                                   # once so hooks-mid-project isn't amnesiac. Only ever
+                                   # bootstraps an empty project; hard-capped. `ai-memory
+                                   # backfill` runs it by hand.
+run_autowire = true                # `ai-memory run <harness>` auto-installs that harness's
+                                   # hooks + MCP on first launch if missing (idempotent,
+                                   # one-time per harness+version). Also `--no-autowire`.
+
 [decay]                            # M8 retention params
 lambda = 0.02                      # ↓ to forget less aggressively
 sigma = 0.6                        # ↑ to reward query-hits more
@@ -587,15 +612,36 @@ enabled = true
 interval_secs = 3600
 max_sessions_per_tick = 1        # per project; scheduler ticks do not overlap
 min_session_age_secs = 600
+
+[retrieval]                       # opt-in ranking signals; all off by default
+query_intent = false              # lexical session-recall routing: queries phrased as
+                                  # "上次 / …的会话 / last time / yesterday" hand session
+                                  # pages back their default kind/tier authority penalty
+session_recall_bonus = 0.25       # extra authority on top of the cancelled penalty;
+                                  # lower it (e.g. 0.15) if rank drift on
+                                  # "之前/上次"-prefixed fact queries matters more
+abstract_vectors = false          # fifth RRF stream over page_abstract_embeddings
+                                  # (L0: each page's frontmatter `abstract:` line, embedded
+                                  # by the same backfill as the body)
 ```
 
 **LLM provider env** (opt-in):
 ```
-AI_MEMORY_LLM_PROVIDER     anthropic | anthropic-oauth | openai | openai-oauth | copilot |
+AI_MEMORY_LLM_PROVIDER     anthropic | anthropic-oauth | openai | openai-oauth | codex | copilot |
                            gemini | openai-compat | opencode
 AI_MEMORY_LLM_MODEL        optional when the provider has a default; e.g. claude-haiku-4-5, gpt-5.4-mini
 ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / LLM_API_KEY
-AI_MEMORY_LLM_BASE_URL     for openai-compat (Ollama, vLLM)
+AI_MEMORY_LLM_BASE_URL     required for openai-compat (Ollama, vLLM); optional override for
+                           opencode (defaults to the Go endpoint, set
+                           https://opencode.ai/zen/v1 for Zen's catalogue).
+                           Applies to any provider: naming ai-memory is how an
+                           operator says a vendor endpoint is proxied on purpose
+LLM_BASE_URL               the unprefixed cross-tool convention, accepted for
+                           openai-compat and opencode only. Providers with a
+                           fixed vendor endpoint (anthropic, openai, gemini,
+                           the OAuth backends, copilot) ignore it and log why —
+                           an operator's leftover Ollama URL must not silently
+                           rewrite every Gemini request into a 404
 AI_MEMORY_LLM_COMPAT_STRICT true by default; false disables response_format=json_schema
 AI_MEMORY_LLM_TIMEOUT_SECS  per-request timeout for chat providers; 300 by default
 AI_MEMORY_LLM_REASONING_EFFORT  optional reasoning/thinking effort
@@ -606,15 +652,90 @@ AI_MEMORY_LLM_REASONING_EFFORT  optional reasoning/thinking effort
                            Codex `reasoning.effort`. Gemini and Copilot
                            ignore the key. Host-unsupported values are
                            clamped to each provider's published enum.
+AI_MEMORY_LLM_HEADERS      optional extra HTTP headers on every chat request, as
+                           comma-separated `Name=Value` (or `Name: Value`) entries;
+                           e.g. `x-opencode-session=prod-01,x-opencode-client=ai-memory`.
+                           For gateways that require a caller-identifying header.
+                           Headers ai-memory sets itself (authorization,
+                           content-type, x-api-key, x-goog-api-key,
+                           anthropic-version, anthropic-beta, openai-beta,
+                           host, content-length) are refused at startup.
+                           Values are never logged. A header value cannot
+                           contain a comma through the env var — use
+                           `llm_headers = [...]` in config.toml for that.
 AI_MEMORY_RERANKER         optional `llm`; reranks project/scopes query candidates
 COPILOT_GITHUB_TOKEN       optional GitHub token for copilot
+AI_MEMORY_CODEX_EXECUTABLE optional Codex executable; defaults to codex on PATH
 GITHUB_COPILOT_API_TOKEN   optional pre-minted Copilot API token
 COPILOT_API_URL            optional Copilot API base URL override
 ```
 
+**Ordered LLM fallback chain** (opt-in, TOML only — see
+`docs/llm-provider-fallback.md`, #648): the primary provider above always
+runs first; `[[llm_fallbacks]]` entries run only after a transient failure
+(429, 5xx, timeout, connection error), in declaration order, with the
+original request/schema/operation id preserved on every attempt. A
+deterministic failure (4xx other than 429, an unsupported schema, a
+malformed response) still stops on the first candidate — no chain-wide
+retry loop.
+
+```toml
+llm_provider = "opencode"
+llm_model = "mimo-v2.5-free"
+
+[[llm_fallbacks]]
+provider = "openai-compat"          # same wire names as llm_provider
+model = "poolside/laguna-s-2.1-free"
+base_url = "http://127.0.0.1:49375/v1"   # required for openai-compat, as above
+api_key_env = "AI_MEMORY_LOCAL_ROUTER_TOKEN"  # env var *name*; the key itself
+                                               # never lives in config.toml
+
+[[llm_fallbacks]]
+provider = "gemini"
+model = "gemini-3.5-flash"
+api_key_env = "GEMINI_API_KEY"
+```
+
+`api_key_env` is required for any provider that needs an API key
+(`anthropic`, `openai`, `gemini`, `opencode`; optional for `openai-compat`,
+which may run keyless) — it is never inherited from the primary's own
+fixed env var, so a fallback cannot look configured while actually
+resolving no credential. It is optional only for a provider with a native
+credential source (`openai-oauth`, `copilot`, `anthropic-oauth`), which
+shares the primary's process-wide token material. `Config::load` validates
+every profile and resolves its credential once, at startup: a
+missing/empty provider or model, an unknown provider, or a missing
+credential fails startup rather than leaving a latent fallback that only
+fails once the primary is already down. Each candidate carries its own
+30s in-memory circuit (`ai_memory_llm::fallback::CIRCUIT_COOLDOWN`): a
+transient failure opens it, a success closes it, and a restart clears all
+circuit state — there is no durable circuit or forced chain-wide deadline.
+
+`GET /admin/status` (`ai-memory status`) reports an `llm_candidates` list
+alongside the existing `llm`/`embedding` roles: each candidate's
+provider/model label, whether it answered the most recently completed
+call, its last success/error timestamp, a redacted error class + HTTP
+status (never a response body or credential), and its circuit-open-until
+timestamp. It is empty for a plain single-provider setup; the top-level
+`llm` role fields are unchanged.
+
+Every chat request carries `User-Agent: ai-memory/<version>`
+(`ai_memory_llm::DEFAULT_USER_AGENT`, layered in `build_provider`). `reqwest`
+sends no user agent unless configured, so provider requests used to arrive
+anonymous — which gateways that require callers to identify themselves report
+as an unknown client. `AI_MEMORY_LLM_HEADERS=user-agent=...` overrides it. The
+Copilot provider keeps `GitHubCopilotChat/<version>` instead, the
+editor-plugin agent GitHub's Copilot API expects.
+
 `openai-oauth` uses `auth login openai-oauth` and stores the ChatGPT/Codex
 refresh token in `<data_dir>/auth.json`; it is separate from MCP/server bearer
 auth and from OpenAI Platform API keys.
+
+`codex` reads only the access token and account id from the Codex CLI-owned
+`auth.json`, resolved from `CODEX_HOME` or the platform home. It never persists
+Codex credentials. A single 401 recovery is serialized and delegated to
+`codex app-server --stdio`, with bounded JSONL/stdout/stderr and a 30-second
+maximum recovery timeout.
 
 `copilot` uses `auth login copilot` or `COPILOT_GITHUB_TOKEN`, exchanges the
 GitHub token through `/copilot_internal/v2/token`, and calls Copilot Chat with
@@ -623,10 +744,10 @@ Copilot chat endpoint.
 
 **Embedder env** (opt-in):
 ```
-AI_MEMORY_EMBEDDING_PROVIDER   openai | voyage | google | gemini | openai-compat
+AI_MEMORY_EMBEDDING_PROVIDER   openai | voyage | google | gemini | openai-compat | copilot
 AI_MEMORY_EMBEDDING_MODEL      e.g. text-embedding-3-small, gemini-embedding-001
 AI_MEMORY_EMBEDDING_BASE_URL   optional override; required for openai-compat
-AI_MEMORY_EMBEDDING_DIM        1536 (OpenAI), 1024 (Voyage), 768 (Google);
+AI_MEMORY_EMBEDDING_DIM        1536 (OpenAI, Copilot), 1024 (Voyage), 768 (Google);
                                required explicitly for openai-compat
 OPENAI_API_KEY / VOYAGE_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY
 LLM_API_KEY                    accepted for openai with a custom base URL and as
@@ -648,6 +769,16 @@ when a custom embedding base URL is set, exactly as before. `voyage` and
 no safe shared model or dimensionality default. It sends no authorization header
 when both `EMBEDDING_API_KEY` and `LLM_API_KEY` are absent and stores vectors
 under the distinct `provider="openai-compat"` identity.
+
+`copilot` takes no API key at all: it resolves the same `CopilotAuth` as the
+`copilot` LLM provider (`auth login copilot`, `COPILOT_GITHUB_TOKEN`, or
+`GITHUB_COPILOT_API_TOKEN`) and shares its GitHub-token -> short-lived
+Copilot-API-token exchange (`CopilotAuthState` in `ai-memory-llm::copilot`) —
+no separate exchange path. It defaults to `text-embedding-3-small` / dim 1536
+and calls Copilot's `/embeddings` endpoint with the same `vscode-chat`
+integration headers as chat. That endpoint's wire shape follows the
+OpenAI-compatible contract Copilot documents for chat, not a published
+embeddings spec, and is not covered by a live test against Copilot here.
 
 ## Future work
 
