@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize, de};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::path_sanitize::slugify_page_path;
 use crate::projection::{ObservationProjectionConfig, cap_text_with_marker, project_observations};
 
 const CHARS_PER_TOKEN: usize = 4;
@@ -295,7 +296,12 @@ pub struct AutoImproveProposal {
     #[serde(default, alias = "body", alias = "markdown", alias = "content")]
     pub body_markdown: String,
     /// `full_page` (default) or `patch`.
+    ///
+    /// Advertised as an enum for the same reason as `operation`; still a
+    /// `String` so an unconstrained provider's `"full"` reaches
+    /// [`normalize_edit_mode`] instead of failing to deserialise.
     #[serde(default = "default_edit_mode")]
+    #[schemars(extend("enum" = ["full_page", "patch"]))]
     pub edit_mode: String,
     /// Patch edits for existing _rules/ or procedures/ pages.
     #[serde(default)]
@@ -356,6 +362,26 @@ fn normalize_operation(raw: &str) -> String {
 
 fn default_edit_mode() -> String {
     "full_page".into()
+}
+
+/// Map the ways a model spells the two supported edit modes onto their
+/// canonical form.
+///
+/// Same narrow policy as [`normalize_operation`]: the system prompt says
+/// "Full-page proposals", and models answer `"full"`. Unknown values are left
+/// untouched so they still fail validation.
+fn normalize_edit_mode(raw: &str) -> String {
+    let squashed: String = raw
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '_' | '-'))
+        .collect();
+    match squashed.as_str() {
+        "" | "fullpage" | "full" => default_edit_mode(),
+        "patch" => "patch".into(),
+        _ => raw.to_string(),
+    }
 }
 
 /// A candidate the reviewer or validator rejected.
@@ -476,6 +502,20 @@ pub async fn run_auto_improve_review(
             false,
         )
         .await?;
+    // The reviewer's recent-page context exists to surface durable knowledge
+    // (`decisions/`, `gotchas/`, `_rules/`, …) so it is not re-proposed. The
+    // shared briefing is recency-ordered and dominated by `sessions/` pages,
+    // which the reviewer must never target (session pages come from session-end
+    // consolidation). Drop them here — auto-improve only — so those slots go to
+    // durable pages. This does NOT touch the shared `briefing_for_project`
+    // reader, so the SessionStart briefing and `memory_briefing`, where session
+    // pages legitimately belong, are unaffected.
+    let reviewer_recent_pages: Vec<_> = briefing
+        .recent_pages
+        .iter()
+        .filter(|page| !page.path.starts_with("sessions/"))
+        .cloned()
+        .collect();
     let session_page_path = format!("sessions/{session_id}.md");
     let session_page = reader
         .page_body_by_ids(workspace_id, project_id, &session_page_path)
@@ -484,7 +524,7 @@ pub async fn run_auto_improve_review(
         reader,
         workspace_id,
         project_id,
-        &briefing.recent_pages,
+        &reviewer_recent_pages,
         &cfg,
     )
     .await?;
@@ -494,7 +534,7 @@ pub async fn run_auto_improve_review(
         &observations,
         duration,
         session_page.as_ref(),
-        &briefing.recent_pages,
+        &reviewer_recent_pages,
         &patchable_pages,
         &rejection_context,
         &cfg,
@@ -505,7 +545,7 @@ pub async fn run_auto_improve_review(
         .cloned()
         .collect();
     let existing_index =
-        ExistingPageIndex::from_pages(&briefing.recent_pages, &prompt_patchable_pages);
+        ExistingPageIndex::from_pages(&reviewer_recent_pages, &prompt_patchable_pages);
     let estimated_input_tokens = estimate_tokens(&prompt_input.prompt);
     let request = ChatRequest {
         system: Some(AUTO_IMPROVE_SYSTEM_PROMPT.to_string()),
@@ -1471,8 +1511,18 @@ pub(crate) fn validate_response(
 fn normalize_proposal(proposal: &mut AutoImproveProposal, warnings: &mut Vec<String>) {
     normalize_kind(proposal, warnings);
 
-    if proposal.edit_mode.trim().is_empty() {
-        proposal.edit_mode = default_edit_mode();
+    // Server-owned: set when a patch is materialized. The schema still shows
+    // it to the model, and a model-supplied non-hash value on a full-page
+    // proposal would reach staging and fail the whole run on `hex_to_sha256`.
+    proposal.expected_base_body_sha256 = None;
+
+    let original_edit_mode = proposal.edit_mode.clone();
+    proposal.edit_mode = normalize_edit_mode(&original_edit_mode);
+    if !original_edit_mode.trim().is_empty() && proposal.edit_mode != original_edit_mode {
+        warnings.push(format!(
+            "proposal {} edit_mode normalized from {:?} to {:?}",
+            proposal.path, original_edit_mode, proposal.edit_mode
+        ));
     }
     if proposal.edit_mode == "patch" {
         return;
@@ -1576,7 +1626,18 @@ fn validate_proposal(
     {
         return Err("missing_evidence".into());
     }
-    let path = PagePath::new(proposal.path.clone()).map_err(|_| "invalid_path".to_string())?;
+    // Same class as bootstrap #847 / consolidation #848: a model-produced
+    // path with a Windows-illegal character (e.g. `:`) passes `PagePath::new`
+    // and would be staged, then fail `ensure_portable` at approve time.
+    // Sanitize before constructing the path so the staged proposal is
+    // applyable; a path that is still unportable after slugify is rejected
+    // rather than queued.
+    let cleaned = slugify_page_path(&proposal.path);
+    let path = PagePath::new(&cleaned).map_err(|_| "invalid_path".to_string())?;
+    if path.ensure_portable().is_err() {
+        return Err("invalid_path".into());
+    }
+    proposal.path = path.as_str().to_string();
     match proposal.edit_mode.as_str() {
         "" | "full_page" => {
             validate_full_page_proposal(proposal, cfg, existing_index, path.as_str())
@@ -1921,6 +1982,47 @@ mod tests {
         }
     }
 
+    /// Records the reviewer prompt so a test can assert what context it saw,
+    /// then returns an empty proposal set (the prompt is the subject under test).
+    #[derive(Clone, Default)]
+    struct CapturingLlm {
+        prompt: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for CapturingLlm {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn model(&self) -> &str {
+            "fake-model"
+        }
+
+        async fn complete(&self, _request: ChatRequest) -> LlmResult<ChatResponse> {
+            Ok(ChatResponse {
+                text: "unused".into(),
+                usage: None,
+                model: "fake-model".into(),
+            })
+        }
+
+        async fn complete_structured_raw(
+            &self,
+            request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> LlmResult<serde_json::Value> {
+            if let Some(message) = request.messages.first() {
+                *self.prompt.lock().unwrap() = Some(message.content.clone());
+            }
+            Ok(serde_json::json!({
+                "summary": "no durable lesson",
+                "proposals": [],
+                "rejected_candidates": []
+            }))
+        }
+    }
+
     fn cfg() -> AutoImproveReviewConfig {
         AutoImproveReviewConfig {
             min_observations: 3,
@@ -1969,7 +2071,10 @@ mod tests {
         AutoImproveEvalConfig {
             enabled: true,
             command,
-            timeout_secs: 2,
+            // Windows PowerShell cold-start is slower than 2s, and these gate
+            // tests run in parallel — timeouts here are for the eval command
+            // itself, not for interpreter startup.
+            timeout_secs: if cfg!(windows) { 8 } else { 2 },
             targets: default_auto_improve_eval_targets(),
             min_delta: 0.01,
         }
@@ -2012,7 +2117,9 @@ mod tests {
                 "$null = [Console]::In.ReadToEnd()\n[Console]::Out.Write('not-json')\n".into()
             }
             "#!/bin/sh\ncat >/dev/null\nsleep 3\n" => {
-                "$null = [Console]::In.ReadToEnd()\nStart-Sleep -Seconds 3\n".into()
+                // Must exceed the Windows eval timeout (8s, see `eval_cfg`)
+                // so the timeout case still times out instead of completing.
+                "$null = [Console]::In.ReadToEnd()\nStart-Sleep -Seconds 12\n".into()
             }
             "#!/bin/sh\nsleep 5\n" => "Start-Sleep -Seconds 20\n".into(),
             "#!/bin/sh\ni=0\nwhile [ $i -lt 70000 ]; do printf x; i=$((i + 1)); done\n" => {
@@ -2116,7 +2223,7 @@ mod tests {
         ];
         for (command, expected_reason) in cases {
             let mut cfg = eval_cfg(command);
-            cfg.timeout_secs = 1;
+            cfg.timeout_secs = if cfg!(windows) { 8 } else { 1 };
             let mut proposals = vec![proposal("_rules/test.md", "rule", 0.9)];
             let mut rejected = Vec::new();
             let mut warnings = Vec::new();
@@ -2274,6 +2381,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: ws,
                 project_id: proj,
@@ -2288,6 +2396,7 @@ mod tests {
                 .writer
                 .insert_observation(Sanitized::new(
                     NewObservation {
+                        occurred_at: None,
                         session_id,
                         workspace_id: ws,
                         project_id: proj,
@@ -2327,6 +2436,122 @@ mod tests {
         assert_eq!(report.proposals.len(), 1);
         assert_eq!(report.proposals[0].path, "procedures/release.md");
         assert!(report.rejected_candidates.is_empty());
+    }
+
+    /// The reviewer's recent-page context must surface durable pages and drop
+    /// `sessions/` pages, so those slots go to knowledge the reviewer might
+    /// re-propose (#834). Both pages are seeded at the same tier, so exclusion
+    /// is by path family, not by tier.
+    #[tokio::test]
+    async fn reviewer_recent_context_excludes_session_pages() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+
+        let seed_page = |path: &str| ai_memory_core::NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new(path).unwrap(),
+            title: path.to_string(),
+            body: format!("# {path}\n\nbody"),
+            tier: ai_memory_core::Tier::Semantic,
+            frontmatter_json: serde_json::json!({}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+            expires_at: None,
+            entities: Vec::new(),
+            evidence: Vec::new(),
+        };
+        store
+            .writer
+            .upsert_page(seed_page("decisions/durable.md"))
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(seed_page("sessions/old-session.md"))
+            .await
+            .unwrap();
+
+        let session_id = ai_memory_core::SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        for i in 0..3 {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: None,
+                        session_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: if i == 0 {
+                            ObservationKind::SessionStart
+                        } else {
+                            ObservationKind::UserPrompt
+                        },
+                        extension: None,
+                        source_event: None,
+                        title: format!("event {i}"),
+                        body: "run the full gate before release".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let llm = CapturingLlm::default();
+        run_auto_improve_review(
+            &store.reader,
+            &llm,
+            ws,
+            proj,
+            session_id,
+            AutoImproveReviewConfig {
+                min_session_duration_secs: 0,
+                ..cfg()
+            },
+        )
+        .await
+        .unwrap();
+
+        let prompt = llm
+            .prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the reviewer must have called the LLM");
+        assert!(
+            prompt.contains("decisions/durable.md"),
+            "the durable decisions page must reach the reviewer's recent context"
+        );
+        assert!(
+            !prompt.contains("sessions/old-session.md"),
+            "session pages must be excluded from the reviewer's recent context"
+        );
     }
 
     #[test]
@@ -2428,6 +2653,53 @@ mod tests {
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0].reason, "invalid_path");
         assert!(warnings.is_empty());
+    }
+
+    /// Same class as bootstrap #847 / consolidation #848: the reviewer LLM
+    /// echoes a conventional-commit subject into the page path. That passes
+    /// `PagePath::new` (deliberately tolerant) but fails `ensure_portable`,
+    /// so the proposal is staged and then cannot be applied.
+    #[test]
+    fn windows_illegal_model_path_is_sanitized_before_staging() {
+        let raw_path = "concepts/build(sandbox): orchestrate.md";
+        assert!(
+            PagePath::new(raw_path).is_ok(),
+            "precondition: PagePath::new is deliberately tolerant of ':'"
+        );
+        assert!(
+            PagePath::new(raw_path).unwrap().ensure_portable().is_err(),
+            "precondition: the raw model path is not portable"
+        );
+
+        let raw: AutoImproveLlmResponse = serde_json::from_value(serde_json::json!({
+            "summary": "ok",
+            "proposals": [{
+                "path": raw_path,
+                "title": "Orchestrate the run",
+                "kind": "concept",
+                "confidence": 0.91,
+                "rationale": "The session recorded a durable conventional-commit workflow.",
+                "evidence": [{"quote": "build(sandbox): orchestrate the run"}],
+                "body_markdown": "# Orchestrate the run\n\nKeep the sandbox build orchestrated."
+            }],
+            "rejected_candidates": []
+        }))
+        .unwrap();
+
+        let (accepted, rejected, warnings) =
+            validate_response(raw, &cfg(), &ExistingPageIndex::default());
+        assert!(
+            rejected.is_empty(),
+            "sanitized path should be accepted: {rejected:?}"
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].path, "concepts/build(sandbox)- orchestrate.md");
+        let path = PagePath::new(&accepted[0].path).unwrap();
+        assert!(
+            path.ensure_portable().is_ok(),
+            "staged path must be applyable"
+        );
     }
 
     #[test]
@@ -3027,6 +3299,66 @@ mod tests {
         );
     }
 
+    /// Same shape as #458 on the neighbouring field: `gpt-oss-20b` via LM
+    /// Studio answered `"edit_mode": "full"` for every candidate, so every run
+    /// ended with zero accepted proposals and only `unsupported_edit_mode`
+    /// rejections.
+    #[test]
+    fn a_proposal_saying_full_is_accepted_as_full_page() {
+        let mut candidate = proposal("gotchas/thing.md", "gotcha", 0.91);
+        candidate.edit_mode = "full".into();
+        let raw = AutoImproveLlmResponse {
+            summary: "ok".into(),
+            proposals: vec![candidate],
+            rejected_candidates: Vec::new(),
+        };
+        let (accepted, rejected, warnings) =
+            validate_response(raw, &cfg(), &ExistingPageIndex::default());
+        assert!(rejected.is_empty(), "got {rejected:?}");
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].edit_mode, "full_page");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("edit_mode normalized from \"full\"")),
+            "normalisation should be reported, got {warnings:?}"
+        );
+
+        let mut unknown = proposal("gotchas/thing.md", "gotcha", 0.91);
+        unknown.edit_mode = "rewrite".into();
+        let raw = AutoImproveLlmResponse {
+            summary: "ok".into(),
+            proposals: vec![unknown],
+            rejected_candidates: Vec::new(),
+        };
+        let (accepted, rejected, _) = validate_response(raw, &cfg(), &ExistingPageIndex::default());
+        assert!(accepted.is_empty());
+        assert_eq!(rejected[0].reason, "unsupported_edit_mode");
+    }
+
+    /// Once `"full"` stopped being rejected, the same `gpt-oss-20b` runs
+    /// failed at staging with `invalid expected_base_body_sha256: expected 64
+    /// hex chars`: the model filled in a field only the server can compute.
+    #[test]
+    fn a_model_supplied_base_sha_is_dropped_from_full_page_proposals() {
+        for supplied in ["", "null", "abc123", "N/A"] {
+            let mut candidate = proposal("gotchas/thing.md", "gotcha", 0.91);
+            candidate.expected_base_body_sha256 = Some(supplied.into());
+            let raw = AutoImproveLlmResponse {
+                summary: "ok".into(),
+                proposals: vec![candidate],
+                rejected_candidates: Vec::new(),
+            };
+            let (accepted, rejected, _) =
+                validate_response(raw, &cfg(), &ExistingPageIndex::default());
+            assert!(rejected.is_empty(), "{supplied:?}: got {rejected:?}");
+            assert_eq!(
+                accepted[0].expected_base_body_sha256, None,
+                "{supplied:?} must not survive to staging"
+            );
+        }
+    }
+
     #[test]
     fn patch_to_missing_or_non_context_target_rejects() {
         let raw = AutoImproveLlmResponse {
@@ -3434,5 +3766,66 @@ mod operation_normalization_tests {
             serde_json::from_value(serde_json::json!({ "operation": "create" }))
                 .expect("must not fail to parse; normalisation happens in validation");
         assert_eq!(parsed.operation, "create");
+    }
+}
+
+#[cfg(test)]
+mod edit_mode_normalization_tests {
+    use super::*;
+
+    #[test]
+    fn the_spellings_models_actually_emit_are_accepted() {
+        for raw in [
+            "full_page",
+            "full",
+            "Full",
+            "full-page",
+            "Full Page",
+            "FULLPAGE",
+            "",
+            "  ",
+        ] {
+            assert_eq!(
+                normalize_edit_mode(raw),
+                "full_page",
+                "{raw:?} means full page and must normalise"
+            );
+        }
+        for raw in ["patch", "PATCH", " Patch "] {
+            assert_eq!(normalize_edit_mode(raw), "patch", "{raw:?} must normalise");
+        }
+    }
+
+    #[test]
+    fn unknown_edit_modes_are_left_to_fail() {
+        for raw in ["rewrite", "replace", "append", "diff", "delete"] {
+            assert_eq!(
+                normalize_edit_mode(raw),
+                raw,
+                "{raw:?} is not a supported mode and must keep failing validation"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_constrains_edit_mode_to_the_supported_values() {
+        let schema = schemars::schema_for!(AutoImproveProposal);
+        let value = serde_json::to_value(&schema).expect("schema serialises");
+        let variants = value
+            .pointer("/properties/edit_mode/enum")
+            .and_then(|e| e.as_array())
+            .expect("edit_mode carries an enum constraint");
+        assert_eq!(
+            variants,
+            &vec![serde_json::json!("full_page"), serde_json::json!("patch")]
+        );
+    }
+
+    #[test]
+    fn a_non_canonical_edit_mode_still_deserialises() {
+        let parsed: AutoImproveProposal =
+            serde_json::from_value(serde_json::json!({ "edit_mode": "full" }))
+                .expect("must not fail to parse; normalisation happens before validation");
+        assert_eq!(parsed.edit_mode, "full");
     }
 }

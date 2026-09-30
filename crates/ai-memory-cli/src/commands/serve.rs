@@ -9,7 +9,7 @@ use std::time::Duration;
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, Consolidator, EmbedBackfillOptions, ObservationRetention,
     ScheduledAutoImproveSettings, run_auto_improve_scheduler_tick, run_embedding_backfill,
-    run_lint, run_sweep_with_options,
+    run_lint,
 };
 use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{
@@ -27,7 +27,7 @@ use ai_memory_store::{
     ReaderPool, Store, TokenPepper, WriterHandle, hash_session_secret, hash_token,
 };
 use ai_memory_web::{WebMountSpec, normalize_prefix, split_web_routers, web_base_href};
-use ai_memory_wiki::{WatcherHandle, Wiki, migrations, run_wiki_migrations};
+use ai_memory_wiki::{WatcherHandle, Wiki, WikiError, WikiResult, migrations, run_wiki_migrations};
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
@@ -609,6 +609,33 @@ fn validate_http_exposure(
     );
 }
 
+/// The operator-facing banner for an exposure that is not [`HttpExposure::Safe`].
+///
+/// Returned as text rather than printed so a test can assert it, and printed at
+/// the call site with `eprintln!` rather than only `tracing::warn!`: the tracing
+/// stderr layer sits behind `EnvFilter`, so `RUST_LOG=error` — or
+/// `log_level = "error"` in the config, which feeds the same filter — silences a
+/// warning whose whole job is to say the server is reachable from the network
+/// without a credential. A security notice a log level can switch off is not a
+/// notice. The structured `tracing::warn!` stays for log collectors.
+fn exposure_banner(exposure: HttpExposure, local_addr: SocketAddr) -> Option<String> {
+    match exposure {
+        HttpExposure::Safe => None,
+        HttpExposure::InsecureByOverride => Some(format!(
+            "WARNING: ai-memory is listening on {local_addr} with NO AUTHENTICATION because \
+             --allow-insecure-no-auth was supplied. Anyone who can reach this address can call \
+             destructive MCP tools."
+        )),
+        HttpExposure::UndeterminedInContainer => Some(format!(
+            "WARNING: ai-memory is listening on {local_addr} with NO AUTHENTICATION. Inside a \
+             container the bind address cannot show whether this port reaches the network - the \
+             host publish spec decides. Published with `-p 127.0.0.1:49374:49374` you are fine; \
+             published on 0.0.0.0 or a LAN address, anyone on the network can call destructive \
+             MCP tools. Run `ai-memory generate-auth-token` and set AI_MEMORY_AUTH_TOKEN."
+        )),
+    }
+}
+
 /// Validate the trusted proxy's least-privilege credential and optional stable
 /// root identity before binding the server.
 fn validate_trusted_proxy_auth(auth: &AuthSettings) -> Result<()> {
@@ -846,6 +873,59 @@ async fn run_session_consolidation_worker(
     }
 }
 
+/// Wraps [`tokio::net::TcpListener`] to enable TCP keepalive on every
+/// accepted connection.
+///
+/// Without this, a hook client whose peer dies without sending FIN (laptop
+/// sleep, a VPN/Tailscale flap, an abrupt kill) leaves its socket
+/// `ESTABLISHED` forever: the OS default is keepalive off, so the fd is
+/// never reclaimed. Over days that leaks one fd per dead peer until
+/// `accept()` starts failing with `EMFILE` and the healthcheck breaks (#792).
+/// Keepalive makes the kernel probe idle connections and close ones whose
+/// peer no longer answers.
+///
+/// This is built on axum's own [`axum::serve::ListenerExt::tap_io`] rather
+/// than a hand-rolled `impl axum::serve::Listener`. A hand-rolled newtype
+/// was tried first: it compiles as a `Listener`, but
+/// `into_make_service_with_connect_info::<SocketAddr>()` additionally needs
+/// `SocketAddr: Connected<IncomingStream<'_, L>>`, and axum only ships that
+/// impl for its own `TcpListener` and for `TapIo<L, F>` (generically, for any
+/// `L: Listener`) — never for an arbitrary third-party `L`. Implementing
+/// `Connected` ourselves is blocked by the orphan rule: neither `Connected`,
+/// `SocketAddr`, nor `IncomingStream` (a plain, non-fundamental axum type) is
+/// local to this crate. `tap_io` is the extension point axum actually
+/// provides for exactly this "touch every accepted `Io`" case, and it keeps
+/// `ConnectInfo` (real peer `SocketAddr`) working for free.
+fn keepalive_listener(
+    listener: tokio::net::TcpListener,
+    keepalive_secs: u64,
+) -> axum::serve::TapIo<
+    tokio::net::TcpListener,
+    impl FnMut(&mut tokio::net::TcpStream) + Send + 'static,
+> {
+    // `None` when `tcp_keepalive_secs = 0` (keepalive disabled) — pass
+    // accepted sockets through unmodified.
+    let keepalive = (keepalive_secs > 0).then(|| {
+        let idle = Duration::from_secs(keepalive_secs);
+        socket2::TcpKeepalive::new()
+            .with_time(idle)
+            .with_interval(idle)
+    });
+    axum::serve::ListenerExt::tap_io(listener, move |stream: &mut tokio::net::TcpStream| {
+        let Some(keepalive) = keepalive.as_ref() else {
+            return;
+        };
+        let sock_ref = socket2::SockRef::from(&*stream);
+        if let Err(error) = sock_ref.set_tcp_keepalive(keepalive) {
+            // Guard, don't panic (runtime paths never unwrap/expect): a
+            // platform or socket-state quirk here should not take down the
+            // connection, just leave it without the reaping this wrapper
+            // exists to provide.
+            tracing::warn!(%error, "failed to set TCP keepalive on accepted connection");
+        }
+    })
+}
+
 /// Run the `serve` subcommand.
 ///
 /// # Errors
@@ -989,12 +1069,41 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         Ok(n) => tracing::info!(count = n, "wrote _meta.md scope manifests"),
         Err(e) => tracing::warn!(error = %e, "scope-manifest backfill failed (non-fatal)"),
     }
-    match wiki.ensure_upgrade_baseline_checkpoint() {
-        Ok(Some(oid)) => {
-            tracing::info!(checkpoint = %oid, "created wiki upgrade baseline checkpoint")
+    // Pages conformed by an older build carry a date-only OKF `stale_after`
+    // copied from `expires_at`; repair them in place. Idempotent; non-fatal.
+    match wiki.repair_date_only_stale_after().await {
+        Ok((0, 0)) => {}
+        Ok((rows, files)) => tracing::info!(
+            rows,
+            files,
+            "repaired date-only OKF stale_after on existing pages"
+        ),
+        Err(e) => tracing::warn!(error = %e, "OKF stale_after repair failed (non-fatal)"),
+    }
+    let baseline_checkpoint = wiki.ensure_upgrade_baseline_checkpoint();
+    match classify_baseline_checkpoint(&baseline_checkpoint) {
+        BaselineCheckpointLog::Created => {
+            if let Ok(Some(oid)) = &baseline_checkpoint {
+                tracing::info!(checkpoint = %oid, "created wiki upgrade baseline checkpoint");
+            }
         }
-        Ok(None) => {}
-        Err(e) => tracing::warn!(error = %e, "wiki upgrade baseline checkpoint failed (non-fatal)"),
+        BaselineCheckpointLog::Clean => {}
+        // An owner-check failure is silent-but-fatal to the wiki git history:
+        // capture keeps working, but no checkpoint is ever committed, so it
+        // must not hide in a WARN. This is the Windows LocalSystem-service /
+        // user-owned-data-dir case (docs/windows.md Scenario E).
+        BaselineCheckpointLog::OwnerFailure => tracing::error!(
+            error = %baseline_checkpoint.as_ref().err().map(ToString::to_string).unwrap_or_default(),
+            "wiki git commits are failing libgit2's owner check: the wiki repository is not \
+             owned by the account running ai-memory. Run the service AS THE OWNING USER (see \
+             docs/windows.md Scenario E) — capture continues, but no wiki checkpoints will be \
+             committed until this is fixed."
+        ),
+        BaselineCheckpointLog::OtherFailure => {
+            if let Err(e) = &baseline_checkpoint {
+                tracing::warn!(error = %e, "wiki upgrade baseline checkpoint failed (non-fatal)");
+            }
+        }
     }
 
     // Keep the guard alive for the lifetime of `serve`.
@@ -1027,6 +1136,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         .with_decay_params(decay_params)
         .with_decay_breadth_weight(config.decay.breadth_weight)
         .with_observation_retention(config.decay.observation_retention())
+        .with_compact_cold_episodic(config.decay.compact_cold_episodic)
         .with_auto_improve_require_approval(config.auto_improve.require_approval)
         .with_auto_improve_review_config(auto_improve_review_config_from_settings(
             &config.auto_improve,
@@ -1045,6 +1155,10 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let server = consolidator_setup.server;
     let consolidator = consolidator_setup.consolidator;
     let admin_llm = consolidator_setup.admin_llm;
+    // Share the tool router's last-activity clock with the B3 dream scheduler so
+    // it can tell an idle box from a busy one and cancel a run on the operator's
+    // return.
+    let activity_clock = server.activity_clock();
     let _maintenance_tasks = start_maintenance_scheduler(
         config.maintenance.clone(),
         config.auto_improve.clone(),
@@ -1054,6 +1168,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         embedder.clone(),
         admin_llm.clone(),
         config.decay,
+        config.dream,
+        activity_clock,
     )
     .await;
 
@@ -1263,6 +1379,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 },
                 config.decay.breadth_weight,
                 config.decay.observation_retention(),
+                config.decay.compact_cold_episodic,
             );
             // Multi-rung auth assembly:
             //   - rung 0 (no bearer_token configured) → AuthState::new
@@ -1397,6 +1514,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 },
             )?;
             let router = machine
+                .merge(healthz_router())
                 .merge(admin)
                 .merge(public_auth_router(auth_state.clone()))
                 .merge(session_auth_router(auth_state.clone()))
@@ -1450,6 +1568,11 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 body_limit_mb = MAX_BODY_BYTES / 1024 / 1024,
                 "MCP HTTP server ready (POST /mcp, POST /hook, Ctrl-C to stop)",
             );
+            // Unconditional: see `exposure_banner` for why this does not ride
+            // on the tracing filter.
+            if let Some(banner) = exposure_banner(exposure, local_addr) {
+                eprintln!("{banner}");
+            }
             if exposure == HttpExposure::InsecureByOverride {
                 tracing::warn!(
                     %local_addr,
@@ -1483,6 +1606,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                      docs/https-via-proxy.md for copy-paste templates."
                 );
             }
+            let listener = keepalive_listener(listener, config.tcp_keepalive_secs);
             let shutdown_cancel = cancel.clone();
             let serve_result = {
                 let serve = axum::serve(
@@ -1551,6 +1675,8 @@ async fn start_maintenance_scheduler(
     embedder: Option<Arc<dyn Embedder>>,
     llm: Option<Arc<dyn LlmProvider>>,
     decay: crate::config::DecaySettings,
+    dream: crate::config::DreamSettings,
+    activity_clock: ai_memory_consolidate::ActivityClock,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let maintenance_enabled = settings.enabled;
     if !maintenance_enabled {
@@ -1561,11 +1687,23 @@ async fn start_maintenance_scheduler(
     let lint_interval_secs = settings.lint_interval_secs;
     let embedding_backfill_interval_secs = settings.embedding_backfill_interval_secs;
 
+    // A3 cold-cluster dedup targets the running server's configured embedder
+    // coordinate; with no embedder it is `None`, making A3 a clean no-op even
+    // when the flag is set (there are no stored vectors to cluster).
+    let dedup_embedding = embedder
+        .as_ref()
+        .map(|e| ai_memory_consolidate::EmbeddingCoord {
+            provider: e.provider().to_string(),
+            model: e.model().to_string(),
+            dim: e.dim(),
+        });
+
     let mut tasks = Vec::new();
     if maintenance_enabled && forget_sweep_interval_secs > 0 {
         let reader = reader.clone();
         let writer = writer.clone();
         let wiki = wiki.clone();
+        let dedup_embedding = dedup_embedding.clone();
         tasks.push(tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(forget_sweep_interval_secs);
             run_persisted_maintenance_job(
@@ -1591,6 +1729,7 @@ async fn start_maintenance_scheduler(
                     let writer = writer.clone();
                     let wiki = wiki.clone();
                     let decay = decay;
+                    let dedup_embedding = dedup_embedding.clone();
                     async move {
                         let started = std::time::Instant::now();
                         let outcome = run_scheduled_sweep_tick(
@@ -1600,6 +1739,8 @@ async fn start_maintenance_scheduler(
                             &decay.decay_params(),
                             decay.breadth_weight,
                             decay.observation_retention(),
+                            decay.compact_cold_episodic,
+                            decay.cold_cluster_dedup(dedup_embedding),
                         )
                         .await?;
                         if outcome.errors > 0 {
@@ -1612,6 +1753,7 @@ async fn start_maintenance_scheduler(
                             scopes = outcome.scopes,
                             candidates_evaluated = outcome.candidates_evaluated,
                             evicted = outcome.evicted,
+                            compacted = outcome.compacted,
                             expired = outcome.expired,
                             hard_deleted = outcome.hard_deleted,
                             observations_pruned = outcome.observations_pruned,
@@ -1800,6 +1942,7 @@ async fn start_maintenance_scheduler(
                 ai_memory_consolidate::ExperienceConfig {
                     sessions: scheduler.experience_sessions.max(1),
                     min_new_sessions: scheduler.experience_every_sessions,
+                    entropy_filter: scheduler.experience_entropy_filter,
                     ..ai_memory_consolidate::ExperienceConfig::default()
                 }
             }),
@@ -1853,6 +1996,41 @@ async fn start_maintenance_scheduler(
         info!("auto-improve scheduler enabled but no LLM provider is configured; job not started");
     }
 
+    // B2/B3/B4 — the opt-in LLM dream pass. OFF by default; it starts only when
+    // `[dream] enabled` is set AND a provider AND an embedder are configured (a
+    // provider-less store keeps the zero-LLM A3 path, invariant #13). It never
+    // contends with live work: it runs only after `idle_window_secs` of quiet and
+    // cancels the moment activity resumes (invariant #5, cancellable + bounded).
+    if dream.enabled {
+        match (llm.clone(), dedup_embedding.clone()) {
+            (Some(llm), Some(embedding)) => {
+                let reader = reader.clone();
+                let wiki = wiki.clone();
+                let activity_clock = activity_clock.clone();
+                let interval = std::time::Duration::from_secs(dream.effective_interval_secs());
+                tasks.push(tokio::spawn(async move {
+                    run_dream_scheduler_loop(
+                        reader,
+                        wiki,
+                        llm,
+                        decay,
+                        dream,
+                        embedding,
+                        activity_clock,
+                        interval,
+                    )
+                    .await;
+                }));
+            }
+            (None, _) => info!(
+                "dream pass enabled but no LLM provider is configured; job not started (the zero-LLM A3 path is unaffected)"
+            ),
+            (_, None) => info!(
+                "dream pass enabled but no embedder is configured; job not started (nothing to cluster)"
+            ),
+        }
+    }
+
     if tasks.is_empty() {
         info!("scheduled maintenance enabled but all intervals are disabled");
     } else {
@@ -1861,17 +2039,121 @@ async fn start_maintenance_scheduler(
     tasks
 }
 
+/// The B3 dream scheduler loop: on its interval, run the dream pass across every
+/// scope ONLY when the operator has been idle for the configured window, and
+/// cancel the in-flight run the moment activity resumes. A cheap watcher task
+/// flips the shared [`ai_memory_consolidate::DreamCancel`] when the activity
+/// clock advances past the run's start; `run_dream_pass` polls it between
+/// clusters.
+#[allow(clippy::too_many_arguments)]
+async fn run_dream_scheduler_loop(
+    reader: ReaderPool,
+    wiki: Wiki,
+    llm: Arc<dyn LlmProvider>,
+    decay: crate::config::DecaySettings,
+    dream: crate::config::DreamSettings,
+    embedding: ai_memory_consolidate::EmbeddingCoord,
+    activity_clock: ai_memory_consolidate::ActivityClock,
+    interval: std::time::Duration,
+) {
+    /// How often the cancel watcher samples the activity clock during a run.
+    const DREAM_ACTIVITY_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+    let cfg = dream.dream_config(Some(embedding));
+    let decay_params = decay.decay_params();
+    loop {
+        tokio::time::sleep(interval).await;
+        let now_us = jiff::Timestamp::now().as_microsecond();
+        if !ai_memory_consolidate::dream_idle_ready(&cfg, activity_clock.last_activity_us(), now_us)
+        {
+            continue;
+        }
+
+        // Cancel-on-activity: snapshot the last activity, then spawn a watcher
+        // that flips the cancel as soon as the clock moves past that snapshot.
+        let cancel = ai_memory_consolidate::DreamCancel::new();
+        let run_start_activity = activity_clock.last_activity_us();
+        let watcher = {
+            let cancel = cancel.clone();
+            let activity_clock = activity_clock.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(DREAM_ACTIVITY_POLL).await;
+                    if activity_clock.last_activity_us() > run_start_activity {
+                        cancel.cancel();
+                        return;
+                    }
+                }
+            })
+        };
+
+        let started = std::time::Instant::now();
+        let scopes = match reader.list_all_scopes().await {
+            Ok(scopes) => scopes,
+            Err(error) => {
+                tracing::warn!(%error, "dream scheduler: could not list scopes; skipping tick");
+                watcher.abort();
+                continue;
+            }
+        };
+        let mut merged = 0usize;
+        let mut superseded = 0usize;
+        let mut cancelled = false;
+        for scope in scopes {
+            if cancel.is_cancelled() {
+                cancelled = true;
+                break;
+            }
+            match ai_memory_consolidate::run_dream_pass(
+                &reader,
+                &wiki,
+                Some(llm.as_ref()),
+                scope.workspace_id,
+                scope.project_id,
+                &decay_params,
+                decay.breadth_weight,
+                &cfg,
+                &cancel,
+                false,
+            )
+            .await
+            {
+                Ok(report) => {
+                    merged += report.clusters_merged;
+                    superseded += report.pages_superseded;
+                    cancelled |= report.cancelled;
+                }
+                Err(error) => tracing::warn!(
+                    workspace = %scope.workspace_name,
+                    project = %scope.project_name,
+                    %error,
+                    "dream pass failed for scope"
+                ),
+            }
+        }
+        watcher.abort();
+        info!(
+            merged,
+            superseded,
+            cancelled,
+            elapsed_ms = started.elapsed().as_millis(),
+            "dream pass tick completed"
+        );
+    }
+}
+
 #[derive(Debug, Default)]
 struct ScheduledSweepTickOutcome {
     scopes: usize,
     candidates_evaluated: usize,
     evicted: usize,
+    compacted: usize,
     expired: usize,
     hard_deleted: usize,
     observations_pruned: usize,
     errors: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_scheduled_sweep_tick(
     reader: &ReaderPool,
     writer: &WriterHandle,
@@ -1879,6 +2161,8 @@ async fn run_scheduled_sweep_tick(
     decay: &ai_memory_store::DecayParams,
     breadth_weight: f64,
     retention: ObservationRetention,
+    compact_cold_episodic: bool,
+    dedup: ai_memory_consolidate::ColdClusterDedup,
 ) -> Result<ScheduledSweepTickOutcome> {
     let scopes = reader.list_all_scopes().await?;
     let mut outcome = ScheduledSweepTickOutcome {
@@ -1887,7 +2171,7 @@ async fn run_scheduled_sweep_tick(
     };
 
     for scope in scopes {
-        match run_sweep_with_options(
+        match ai_memory_consolidate::run_sweep_with_hygiene(
             reader,
             writer,
             Some(wiki),
@@ -1896,6 +2180,8 @@ async fn run_scheduled_sweep_tick(
             decay,
             breadth_weight,
             retention,
+            compact_cold_episodic,
+            dedup.clone(),
             false,
         )
         .await
@@ -1903,6 +2189,11 @@ async fn run_scheduled_sweep_tick(
             Ok(report) => {
                 outcome.candidates_evaluated += report.candidates_evaluated;
                 outcome.evicted += report.evicted.iter().filter(|page| page.deleted).count();
+                outcome.compacted += report
+                    .compacted
+                    .iter()
+                    .filter(|page| page.compacted)
+                    .count();
                 outcome.expired += report.expired.len();
                 outcome.hard_deleted += report.hard_deleted;
                 outcome.observations_pruned += report.observations_pruned;
@@ -1952,6 +2243,10 @@ async fn run_scheduled_lint_tick(
                 dry_run: false,
                 use_llm: false,
                 decay_lambda,
+                // The automatic scheduled lint stays rule-based: the A5
+                // contradiction detector is on for the user-invoked
+                // `memory_lint` / admin lint, not the background sweep.
+                embedding: None,
             },
         )
         .await
@@ -2339,6 +2634,22 @@ fn llm_retry_hint(provider: &str, model: &str, base_url: Option<&str>) -> String
     command
 }
 
+/// Liveness probe for process supervisors.
+///
+/// Unauthenticated on purpose: launchd, systemd and `HEALTHCHECK` have no
+/// bearer token, and the answer ("this process is listening") is already
+/// observable by connecting to the port. It reads nothing and reports no
+/// store, provider or auth state.
+///
+/// Without it the only live signal is `GET /mcp` answering 405, which is an
+/// accident of method routing rather than a contract a supervisor can rely on.
+fn healthz_router() -> axum::Router {
+    axum::Router::new().route(
+        "/healthz",
+        axum::routing::get(|| async { axum::Json(serde_json::json!({ "status": "ok" })) }),
+    )
+}
+
 fn apply_host_layer(router: axum::Router, allowed_hosts: Vec<String>) -> axum::Router {
     router.layer(axum::middleware::from_fn_with_state(
         Arc::new(allowed_hosts),
@@ -2425,6 +2736,31 @@ async fn seed_active_project_fallback(reader: &ReaderPool, active_project: &Acti
     }
 }
 
+/// How a wiki baseline-checkpoint attempt should be surfaced at startup.
+/// Extracted from the logging call so the owner-vs-other classification is
+/// unit-testable without standing up a server: a real LocalSystem-service
+/// owner failure needs a native Windows box, which is out of scope here.
+#[derive(Debug, PartialEq, Eq)]
+enum BaselineCheckpointLog {
+    /// A checkpoint commit was created (INFO).
+    Created,
+    /// Nothing to commit (silent).
+    Clean,
+    /// libgit2 refused on its ownership guard — actionable, logged at ERROR.
+    OwnerFailure,
+    /// Any other failure — non-fatal, logged at WARN as before.
+    OtherFailure,
+}
+
+fn classify_baseline_checkpoint<T>(result: &WikiResult<Option<T>>) -> BaselineCheckpointLog {
+    match result {
+        Ok(Some(_)) => BaselineCheckpointLog::Created,
+        Ok(None) => BaselineCheckpointLog::Clean,
+        Err(WikiError::GitOwner(_)) => BaselineCheckpointLog::OwnerFailure,
+        Err(_) => BaselineCheckpointLog::OtherFailure,
+    }
+}
+
 fn host_without_port(host: &str) -> &str {
     if let Some(rest) = host.strip_prefix('[')
         && let Some((inside, _)) = rest.split_once(']')
@@ -2454,6 +2790,41 @@ mod tests {
     use std::pin::Pin;
     use tempfile::TempDir;
     use tower::ServiceExt;
+
+    /// An owner-check failure of the startup wiki baseline checkpoint must be
+    /// classified as an ERROR-worthy `OwnerFailure`, not the WARN-only
+    /// `OtherFailure` that hid it before (#872). A generic error stays
+    /// `OtherFailure`, and the success/clean cases are unchanged — this is the
+    /// seam that decides the log level, so it bites here.
+    ///
+    /// A full native-Windows LocalSystem-service repro (the environment that
+    /// actually raises `code=Owner`) is out of scope; this covers the mapping
+    /// from `WikiError::GitOwner` to the ERROR branch.
+    #[test]
+    fn owner_failure_baseline_checkpoint_is_error_not_warn() {
+        let owner: WikiResult<Option<()>> = Err(WikiError::GitOwner("not owned".into()));
+        assert_eq!(
+            classify_baseline_checkpoint(&owner),
+            BaselineCheckpointLog::OwnerFailure,
+            "owner-check failure must be surfaced at ERROR, not buried in a WARN"
+        );
+
+        let other: WikiResult<Option<()>> = Err(WikiError::Io(std::io::Error::other("disk gone")));
+        assert_eq!(
+            classify_baseline_checkpoint(&other),
+            BaselineCheckpointLog::OtherFailure,
+            "a non-owner failure stays a non-fatal WARN"
+        );
+
+        assert_eq!(
+            classify_baseline_checkpoint(&Ok::<_, WikiError>(Some(()))),
+            BaselineCheckpointLog::Created
+        );
+        assert_eq!(
+            classify_baseline_checkpoint(&Ok::<Option<()>, WikiError>(None)),
+            BaselineCheckpointLog::Clean
+        );
+    }
 
     async fn wait_for_maintenance_success(
         store: &Store,
@@ -2674,6 +3045,49 @@ mod tests {
             validate_http_exposure(loopback, true, true, false, false, false).unwrap(),
             HttpExposure::Safe
         );
+    }
+
+    /// The exposure notice must not be something a log level can switch off.
+    /// `exposure_banner` is printed with `eprintln!`, outside the tracing
+    /// `EnvFilter`, so `RUST_LOG=error` or `log_level = "error"` cannot hide
+    /// that the server is reachable without a credential.
+    #[test]
+    fn every_unsafe_exposure_produces_an_operator_banner() {
+        let addr: SocketAddr = "0.0.0.0:49374".parse().expect("valid test address");
+
+        assert_eq!(exposure_banner(HttpExposure::Safe, addr), None);
+
+        let override_banner = exposure_banner(HttpExposure::InsecureByOverride, addr)
+            .expect("an unauthenticated override must be announced");
+        assert!(override_banner.contains("NO AUTHENTICATION"));
+        assert!(override_banner.contains("0.0.0.0:49374"));
+        assert!(override_banner.contains("--allow-insecure-no-auth"));
+
+        let container_banner = exposure_banner(HttpExposure::UndeterminedInContainer, addr)
+            .expect("an unauthenticated container bind must be announced");
+        assert!(container_banner.contains("NO AUTHENTICATION"));
+        assert!(container_banner.contains("0.0.0.0:49374"));
+        // The remedy has to be in the text: the operator reading this on a
+        // terminal has no log collector to go digging in.
+        assert!(container_banner.contains("AI_MEMORY_AUTH_TOKEN"));
+    }
+
+    /// The Quick Start shape from #407 is exactly the one #902 reports as
+    /// silently exposed, so the two must agree: still not refused, but now
+    /// unconditionally announced.
+    #[test]
+    fn the_quick_start_container_bind_is_announced_not_refused() {
+        let quick_start: SocketAddr = "0.0.0.0:49374".parse().expect("valid test address");
+
+        let exposure = validate_http_exposure(quick_start, false, false, false, false, true)
+            .expect("must not refuse");
+        assert_eq!(exposure, HttpExposure::UndeterminedInContainer);
+        assert!(exposure_banner(exposure, quick_start).is_some());
+
+        // With a token configured there is nothing to announce.
+        let authed = validate_http_exposure(quick_start, true, false, false, false, true)
+            .expect("auth is fine");
+        assert_eq!(exposure_banner(authed, quick_start), None);
     }
 
     /// Regression for #407. The published image binds `0.0.0.0` because that
@@ -3147,6 +3561,8 @@ mod tests {
             None,
             None,
             crate::config::DecaySettings::default(),
+            crate::config::DreamSettings::default(),
+            ai_memory_consolidate::ActivityClock::default(),
         )
         .await;
         assert!(tasks.is_empty());
@@ -3191,6 +3607,8 @@ mod tests {
                 None,
                 None,
                 crate::config::DecaySettings::default(),
+                crate::config::DreamSettings::default(),
+                ai_memory_consolidate::ActivityClock::default(),
             )
             .await;
             // One enabled lint/sweep job plus the independent hollow-project job.
@@ -3312,6 +3730,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id,
                 project_id: worked_in,
@@ -3325,6 +3744,7 @@ mod tests {
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id,
                     project_id: worked_in,
@@ -3413,6 +3833,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id,
                 project_id: elsewhere,
@@ -3426,6 +3847,7 @@ mod tests {
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id,
                     project_id: elsewhere,
@@ -3475,6 +3897,7 @@ mod tests {
         store
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id,
                 project_id,
@@ -3488,6 +3911,7 @@ mod tests {
             .writer
             .insert_observation(Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id,
                     project_id,
@@ -3635,6 +4059,8 @@ mod tests {
             &decay,
             0.0,
             ObservationRetention::default(),
+            false,
+            ai_memory_consolidate::ColdClusterDedup::default(),
         )
         .await
         .unwrap();
@@ -4029,7 +4455,8 @@ mod tests {
                 require_dual_auth,
             )))
             .merge(web.public)
-            .merge(ai_memory_web::favicon_router());
+            .merge(ai_memory_web::favicon_router())
+            .merge(healthz_router());
 
         // Mutation captured: dropping any host-owned route merge lets the root SPA
         // wildcard return its HTML shell instead of the reserved route response.
@@ -4057,6 +4484,21 @@ mod tests {
                 "{path} must reach its authenticated host route"
             );
         }
+
+        // A supervisor probing liveness sends no bearer token, so /healthz has to
+        // answer 200 with auth configured — and it is a host-owned route like the
+        // ones above, so the SPA wildcard must not serve its shell here either.
+        let health = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
 
         let api = router
             .clone()
@@ -4573,6 +5015,44 @@ mod tests {
                 "https://b.example.com",
                 "https://c.example.com"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn keepalive_listener_enables_socket_keepalive_when_configured() {
+        use axum::serve::Listener as _;
+
+        let raw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut listener = keepalive_listener(raw, 60);
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+        let (accepted, _peer) = listener.accept().await;
+        let _client = client.await.unwrap().unwrap();
+
+        let sock_ref = socket2::SockRef::from(&accepted);
+        assert!(
+            sock_ref.keepalive().unwrap(),
+            "SO_KEEPALIVE must be enabled when tcp_keepalive_secs > 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn keepalive_listener_disables_socket_keepalive_when_idle_is_zero() {
+        use axum::serve::Listener as _;
+
+        let raw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut listener = keepalive_listener(raw, 0);
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+        let (accepted, _peer) = listener.accept().await;
+        let _client = client.await.unwrap().unwrap();
+
+        let sock_ref = socket2::SockRef::from(&accepted);
+        assert!(
+            !sock_ref.keepalive().unwrap(),
+            "SO_KEEPALIVE must stay off when tcp_keepalive_secs = 0"
         );
     }
 }

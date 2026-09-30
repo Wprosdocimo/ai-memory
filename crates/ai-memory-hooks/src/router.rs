@@ -19,7 +19,10 @@ use ai_memory_core::{
     NewSession, ObservationKind, ProjectId, Sanitized, Sanitizer, SessionId, WorkspaceId,
     WorkstreamEvent, WorkstreamEventKind,
 };
-use ai_memory_store::{HookSessionAdmission, IngestObservationOutcome, StoreError, WriterHandle};
+use ai_memory_store::{
+    HookSessionAdmission, IngestObservationOutcome, StoreError, WriterHandle,
+    lookup_existing_workspace,
+};
 use ai_memory_wiki::{AdmissionContext, AdmissionOp, Wiki};
 use axum::Json;
 use axum::Router;
@@ -33,8 +36,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::capture_policy::{
-    CaptureConfig, CaptureDisposition, CapturePolicy, CaptureProtocol, CaptureSource, PolicyState,
-    ToolFamily, metadata_only_body, tool_observation_outcome, valid_call_id,
+    CaptureConfig, CaptureDisposition, CapturePolicy, CaptureProtocol, CaptureSource,
+    ExtractionState, PolicyState, ToolFamily, metadata_only_body, tool_observation_outcome,
+    valid_call_id,
 };
 use crate::log;
 use crate::payload::{
@@ -890,12 +894,12 @@ fn inspect_capture_envelope(env: HookEnvelope) -> Option<HookEnvelope> {
     let direct = |state| capture_inspector(state, cwd).inspect(env.agent, &env.raw, cwd);
 
     let Some(protocol) = CaptureProtocol::parse(raw_protocol) else {
-        // A new/malformed marker must not make a recognized file operation
-        // less private. Mark the replacement invalid: an inactive/keep
-        // protocol would falsely describe the server's privacy fallback.
-        // Non-file legacy payloads retain their old behavior.
+        // A new/malformed marker must not make a file operation or shell
+        // command less private. Mark the replacement invalid: an
+        // inactive/keep protocol would falsely describe the server's privacy
+        // fallback.
         let decision = direct(PolicyState::Invalid);
-        if decision.protocol().tool_family() == ToolFamily::File {
+        if decision.protocol().disposition() == CaptureDisposition::MetadataOnly {
             return Some(metadata_envelope(env, &decision, None));
         }
         return Some(env);
@@ -993,11 +997,18 @@ fn metadata_only_protocol_envelope(
     Some(env)
 }
 
+/// An invalid marker also strips shell commands, which it cannot prove miss
+/// every ignored path; an active policy decides them outright (keep/drop).
+/// A stripped shell body carries no paths and an extracted command.
 const fn metadata_protocol_is_legal(protocol: &CaptureProtocol) -> bool {
-    matches!(
-        (protocol.policy_state(), protocol.tool_family()),
-        (PolicyState::Active | PolicyState::Invalid, ToolFamily::File)
-    )
+    match (protocol.policy_state(), protocol.tool_family()) {
+        (PolicyState::Active | PolicyState::Invalid, ToolFamily::File) => true,
+        (PolicyState::Invalid, ToolFamily::NonFile) => {
+            protocol.path_count() == 0
+                && matches!(protocol.extraction_state(), ExtractionState::Extracted)
+        }
+        _ => false,
+    }
 }
 
 fn valid_metadata_call_id(value: &serde_json::Value) -> bool {
@@ -1353,6 +1364,7 @@ async fn fetch_and_accept_handoff(
     let receiving_session = if handoff.is_some() {
         match accepting_session {
             Some(id) => Some(NewSession {
+                occurred_at: None,
                 id,
                 workspace_id: ws,
                 project_id: proj,
@@ -2020,9 +2032,8 @@ async fn resolve_project_ids_inner(
     project_override: Option<&str>,
     project_strategy: ProjectStrategy,
 ) -> anyhow::Result<(WorkspaceId, ProjectId)> {
-    let cwd_norm = cwd
-        .filter(|s| !s.is_empty())
-        .map(normalize_project_path_key);
+    let cwd_raw = cwd.filter(|s| !s.is_empty());
+    let cwd_norm = cwd_raw.map(normalize_project_path_key);
 
     // Without cwd AND without a project override, there's nothing to
     // resolve — fall through to the server defaults.
@@ -2048,23 +2059,32 @@ async fn resolve_project_ids_inner(
         .unwrap_or(DEFAULT_WORKSPACE_NAME)
         .to_string();
 
-    let (project_name, repo_path) = match (project_override, cwd_norm.as_deref()) {
-        (Some(p), Some(c)) => (
+    // The project NAME must come from the RAW cwd: `normalize_project_path_key`
+    // ASCII-lowercases the *entire* Windows drive-letter/UNC path — basename
+    // included — so deriving the name from `cwd_norm` mints "default project"
+    // for a folder the CLI (which keeps the raw basename) calls "Default
+    // Project". `get_or_create_project` matches names case-sensitively, so one
+    // folder becomes two projects (#871). The cache key and the cwd-prefix
+    // match below deliberately keep `cwd_norm` (case-folded) so #806 handoff
+    // stickiness is unaffected, and `derive_project_from_cwd` re-normalizes the
+    // repo_path it returns regardless of the input casing.
+    let (project_name, repo_path) = match (project_override, cwd_raw, cwd_norm.as_deref()) {
+        (Some(p), _, Some(c)) => (
             p.to_string(),
             repo_path_from_project_override(c, p, project_strategy),
         ),
-        (Some(p), None) => (p.to_string(), None),
-        (None, Some(c)) => match derive_project_from_cwd(c, project_strategy) {
+        (Some(p), _, None) => (p.to_string(), None),
+        (None, Some(raw), Some(_)) => match derive_project_from_cwd(raw, project_strategy) {
             Some(resolved) => resolved,
             None => return Ok((state.workspace_id, state.project_id)),
         },
-        (None, None) => {
+        _ => {
             // The early-return at the top of the function guards
-            // against this branch; the explicit fallback here keeps
-            // the resolver panic-free if that guard ever moves or
-            // gets refactored. Same effect as `unreachable!`, but
-            // visible at compile time instead of inside the panic
-            // message.
+            // against a cwd-less, override-less event; the explicit
+            // fallback here keeps the resolver panic-free if that guard
+            // ever moves or gets refactored. Same effect as
+            // `unreachable!`, but visible at compile time instead of
+            // inside the panic message.
             return Ok((state.workspace_id, state.project_id));
         }
     };
@@ -2331,6 +2351,39 @@ fn sticky_out_of_tree_under_repo_root(
         && meaningful_session_anchor(session_cwd, home_dir).is_some()
 }
 
+/// Whether `workspace_override`, resolved against the session's own
+/// workspace, is a genuine rescope (issue #976).
+///
+/// `workspace` is a *required* key in every `.ai-memory.toml` (see
+/// `docs/marker-file.md`), so the host-side hook forwards `&workspace=…` on
+/// every event under any marker's tree — including events that never left the
+/// session's own workspace. Treating that presence alone as a rescope (the
+/// pre-#976 behavior) silently disqualified sticky routing for every
+/// marker-covered install, because the marker's own workspace rides along
+/// with every event whether or not the agent actually moved.
+///
+/// `None` never disqualifies. `Some(name)` that resolves, via the existing
+/// no-create scope lookup (never a hand-rolled chain — see the "Scope
+/// resolution" rule in AGENTS.md), to the SAME workspace as the session is
+/// not a rescope either: the event just re-declared where it already is.
+/// Different, or unresolvable (a typo, a workspace that doesn't exist yet),
+/// fails closed and is treated as a genuine rescope — matching
+/// `ProjectSource::parse`'s fail-closed stance in this same file: a typo must
+/// never silently downgrade a real rescope into a sticky no-op.
+async fn workspace_override_is_rescope(
+    reader: &ai_memory_store::ReaderPool,
+    workspace_override: Option<&str>,
+    session_workspace: WorkspaceId,
+) -> bool {
+    let Some(name) = workspace_override else {
+        return false;
+    };
+    match lookup_existing_workspace(reader, name).await {
+        Ok(resolved) => resolved != session_workspace,
+        Err(_) => true,
+    }
+}
+
 /// Whether this event's declared overrides leave room for session-sticky
 /// attribution at all (issue #394's `sticky` knob).
 ///
@@ -2343,14 +2396,17 @@ fn sticky_out_of_tree_under_repo_root(
 /// too old to tag its override reports `Unspecified` and keeps today's
 /// behavior, so `sticky` degrades safely rather than silently capturing
 /// deliberate rescopes.
+///
+/// `workspace_is_rescope` is [`workspace_override_is_rescope`]'s verdict,
+/// resolved by the caller before this function runs (it needs the session's
+/// own workspace and a DB read that this function has no access to).
 fn overrides_permit_sticky(
-    workspace_override: Option<&str>,
+    workspace_is_rescope: bool,
     project_override: Option<&str>,
     project_source: ProjectSource,
     routing: MidSessionRouting,
 ) -> bool {
-    // A workspace override only ever comes from a marker file.
-    if workspace_override.is_some() {
+    if workspace_is_rescope {
         return false;
     }
     if project_override.is_none() {
@@ -2544,27 +2600,38 @@ async fn process_authorized(
     // - Under `[routing] mid_session = "sticky"` the session also overrules a
     //   host-derived `repo-root` override, closing the cross-repo `cd` case;
     //   marker-declared scopes still win. See `overrides_permit_sticky`.
-    let sticky_scope = if overrides_permit_sticky(
-        env.workspace_override.as_deref(),
-        env.project_override.as_deref(),
-        env.project_source,
-        state.mid_session_routing,
-    ) {
-        state
-            .reader
-            .find_session_scope(session_id)
-            .await?
-            .filter(|(_, _, session_cwd)| {
-                sticky_cwd_admits(
-                    session_cwd.as_deref(),
-                    env.cwd.as_deref(),
-                    state.home_dir.as_deref(),
-                    env.project_strategy,
-                    state.mid_session_routing,
-                )
-            })
-    } else {
-        None
+    //
+    // `find_session_scope` runs unconditionally (issue #976) — the
+    // `workspace_override.is_some()` early return used to gate it, so a
+    // marker's mandatory `workspace` key disqualified stickiness before the
+    // session's own workspace was ever consulted. Resolving the session's
+    // scope first lets `workspace_override_is_rescope` compare the two:
+    // "still the session's own workspace" is not a rescope, only a genuinely
+    // different (or unresolvable) one is.
+    let session_scope = state.reader.find_session_scope(session_id).await?;
+    let sticky_scope = match session_scope {
+        Some((session_ws, session_proj, session_cwd)) => {
+            let workspace_is_rescope = workspace_override_is_rescope(
+                &state.reader,
+                env.workspace_override.as_deref(),
+                session_ws,
+            )
+            .await;
+            let permits = overrides_permit_sticky(
+                workspace_is_rescope,
+                env.project_override.as_deref(),
+                env.project_source,
+                state.mid_session_routing,
+            ) && sticky_cwd_admits(
+                session_cwd.as_deref(),
+                env.cwd.as_deref(),
+                state.home_dir.as_deref(),
+                env.project_strategy,
+                state.mid_session_routing,
+            );
+            permits.then_some((session_ws, session_proj, session_cwd))
+        }
+        None => None,
     };
     let publishable_scope = sticky_scope.is_some()
         || has_publishable_scope_hint(env.cwd.as_deref(), env.project_override.as_deref());
@@ -2645,6 +2712,7 @@ async fn process_authorized(
             agent_kind: env.agent,
             cwd: env.cwd.as_ref().map(std::path::PathBuf::from),
             actor_user: owner_stamp.clone(),
+            occurred_at: env.occurred_at_micros(),
         };
         let kind = env.event.to_observation_kind();
         let raw_obs = NewObservation {
@@ -2660,6 +2728,7 @@ async fn process_authorized(
                 .unwrap_or_else(|| kind.as_str().to_string()),
             body: env.body_excerpt.clone().unwrap_or_default(),
             importance: importance_for(env.event),
+            occurred_at: env.occurred_at_micros(),
         };
         let sanitized = Sanitized::new(raw_obs, &state.sanitizer);
         let log_title = sanitized.inner().title.clone();
@@ -2845,7 +2914,7 @@ async fn process_authorized(
         if is_ephemeral_session(&observations) {
             let outcome = state
                 .writer
-                .end_admitted_lifecycle_only_session(admitted.clone())
+                .end_admitted_lifecycle_only_session(admitted.clone(), env.occurred_at_micros())
                 .await?;
             match outcome {
                 ai_memory_store::LifecycleOnlyEndOutcome::Ended { reopened_handoff } => {
@@ -2974,13 +3043,18 @@ async fn process_authorized(
             Some(handoff) => Some(
                 state
                     .writer
-                    .end_admitted_session_with_handoff(admitted.clone(), Some(page_id), handoff)
+                    .end_admitted_session_with_handoff(
+                        admitted.clone(),
+                        Some(page_id),
+                        handoff,
+                        env.occurred_at_micros(),
+                    )
                     .await?,
             ),
             None => {
                 state
                     .writer
-                    .end_admitted_session(admitted.clone(), Some(page_id))
+                    .end_admitted_session(admitted.clone(), Some(page_id), env.occurred_at_micros())
                     .await?;
                 None
             }
@@ -3128,7 +3202,14 @@ fn build_auto_handoff(
                     prompts.push(text.to_string());
                 }
             }
-            ObservationKind::PostToolUse | ObservationKind::PreToolUse if !obs.title.is_empty() => {
+            // Skip `tool <family>` / bare-`<family>` labels: a family is a
+            // partition of the calls, not a name for a tool, so "Tools used:
+            // tool file, tool non-file" tells the receiver nothing. Only a
+            // harness's own tool name is worth listing.
+            ObservationKind::PostToolUse | ObservationKind::PreToolUse
+                if !obs.title.is_empty()
+                    && crate::payload::tool_family_from_title(&obs.title).is_none() =>
+            {
                 tools.insert(obs.title.as_str());
             }
             _ => {}
@@ -3214,10 +3295,12 @@ fn derive_open_questions(
     // abnormally while working in the tree.
     //
     // The signal is the tool *family*, not the tool name. A PostToolUse
-    // observation's title is `canonical_tool_name(tool_family)`, which is
-    // only ever "file" / "search-list" / "non-file" / "unknown" — the
-    // reserved protocol deliberately carries no raw tool names. Matching
-    // "edit"/"write"/"patch" against that title can never succeed.
+    // observation's title carries the family in one of two spellings: the
+    // majority path (every closed-tool agent) writes `safe_tool_title`'s
+    // `"tool file"` / `"tool non-file"` / …, while the reserved-protocol
+    // path writes the bare `canonical_tool_name` form `"file"` / …. Both
+    // must match here, and `tool_family_from_title` recognises both; a raw
+    // tool name ("edit"/"write"/"patch") is neither and correctly does not.
     //
     // That same closed schema means read and write are indistinguishable:
     // `ToolFamily::File` covers both, and `ToolOutcome` is only
@@ -3225,7 +3308,8 @@ fn derive_open_questions(
     // made — only that the session touched files and then ended without a
     // normal Stop, which is worth telling the receiver either way.
     if let Some(tool) = last_tool {
-        let touched_files = tool.title == canonical_tool_name(ToolFamily::File);
+        let touched_files =
+            crate::payload::tool_family_from_title(&tool.title) == Some(ToolFamily::File);
         if touched_files && last_stop.is_none() {
             return vec![
                 "Session ended without a normal stop while working with files".into(),
@@ -3760,6 +3844,7 @@ mod tests {
         state
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: session_id,
                 workspace_id: state.workspace_id,
                 project_id: state.project_id,
@@ -3774,6 +3859,7 @@ mod tests {
             .insert_observation_ingest(
                 Sanitized::new(
                     NewObservation {
+                        occurred_at: None,
                         session_id,
                         workspace_id: state.workspace_id,
                         project_id: state.project_id,
@@ -4309,40 +4395,102 @@ mod tests {
     // The override gate for `[routing] mid_session` (#394). The invariant
     // under test: a marker-declared project is a deliberate rescope and wins
     // in BOTH modes; only a host-derived repo-root name may yield, and only
-    // under `sticky`.
+    // under `sticky`. The workspace side of the gate is exercised in terms of
+    // `workspace_is_rescope` directly here (the caller's already-resolved
+    // verdict) — `workspace_override_is_rescope`'s own DB-backed resolution
+    // (same-workspace vs. different vs. unresolvable) is covered separately
+    // below (issue #976) and in the `cross_repo_cd`-based integration tests.
     #[test]
     fn override_gate_distinguishes_marker_from_derived_project() {
         use MidSessionRouting::{FollowCwd, Sticky};
         use ProjectSource::{Marker, RepoRoot, Unspecified};
 
-        // (workspace, project, source, routing, expected)
+        // (workspace_is_rescope, project, source, routing, expected)
         let cases = [
-            // No override at all: both modes may stick (pre-#394 behavior).
-            (None, None, Unspecified, FollowCwd, true),
-            (None, None, Unspecified, Sticky, true),
+            // No workspace rescope, no project override: both modes may
+            // stick (pre-#394 behavior).
+            (false, None, Unspecified, FollowCwd, true),
+            (false, None, Unspecified, Sticky, true),
             // Marker-declared project: never yields, in either mode.
-            (None, Some("acme"), Marker, FollowCwd, false),
-            (None, Some("acme"), Marker, Sticky, false),
+            (false, Some("acme"), Marker, FollowCwd, false),
+            (false, Some("acme"), Marker, Sticky, false),
             // Host-derived repo-root name: yields only under `sticky`. This
             // is the cross-repo `cd` case the knob exists for.
-            (None, Some("acme"), RepoRoot, FollowCwd, false),
-            (None, Some("acme"), RepoRoot, Sticky, true),
+            (false, Some("acme"), RepoRoot, FollowCwd, false),
+            (false, Some("acme"), RepoRoot, Sticky, true),
             // An untagged override from an older client stays authoritative,
             // so `sticky` degrades safely instead of capturing a rescope.
-            (None, Some("acme"), Unspecified, Sticky, false),
-            // A marker workspace is itself a deliberate scope declaration.
-            (Some("oss"), None, Unspecified, Sticky, false),
-            (Some("oss"), Some("acme"), RepoRoot, Sticky, false),
+            (false, Some("acme"), Unspecified, Sticky, false),
+            // A genuine workspace rescope (a marker naming a DIFFERENT
+            // workspace than the session's own, or an unresolvable one)
+            // disqualifies sticky outright, regardless of project override.
+            (true, None, Unspecified, Sticky, false),
+            (true, Some("acme"), RepoRoot, Sticky, false),
         ];
-        for (ws, project, source, routing, expected) in cases {
+        for (workspace_is_rescope, project, source, routing, expected) in cases {
             assert_eq!(
-                overrides_permit_sticky(ws, project, source, routing),
+                overrides_permit_sticky(workspace_is_rescope, project, source, routing),
                 expected,
-                "ws={ws:?} project={project:?} source={} routing={}",
+                "workspace_is_rescope={workspace_is_rescope:?} project={project:?} source={} routing={}",
                 source.as_str(),
                 routing.as_str(),
             );
         }
+    }
+
+    // Issue #976: `workspace_override_is_rescope`'s own resolution, in
+    // isolation from the rest of the sticky gate. `workspace` is a required
+    // marker key, so every marker-covered install forwards it on every
+    // event — the same workspace the session is already in, most of the
+    // time. Only a genuinely different (or unresolvable) workspace name may
+    // disqualify stickiness.
+    #[tokio::test]
+    async fn workspace_override_is_rescope_only_on_a_genuine_workspace_change() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let other_ws = state
+            .writer
+            .get_or_create_workspace("other-workspace")
+            .await
+            .unwrap();
+
+        // No override at all: never a rescope.
+        assert!(
+            !workspace_override_is_rescope(&state.reader, None, state.workspace_id).await,
+            "a missing workspace override must never disqualify sticky"
+        );
+        // The marker re-declaring the session's OWN workspace: not a
+        // rescope — this is the exact #976 repro (every event under a
+        // marker's tree carries the workspace it's already in).
+        assert!(
+            !workspace_override_is_rescope(&state.reader, Some("default"), state.workspace_id)
+                .await,
+            "re-declaring the session's own workspace must not disqualify sticky"
+        );
+        // A marker naming a genuinely different, EXISTING workspace: a real
+        // rescope.
+        assert!(
+            workspace_override_is_rescope(
+                &state.reader,
+                Some("other-workspace"),
+                state.workspace_id
+            )
+            .await,
+            "a marker naming a different workspace must disqualify sticky"
+        );
+        let _ = other_ws;
+        // An unresolvable workspace name (typo, not-yet-created): fails
+        // closed, exactly like `ProjectSource::parse`'s stance on an unknown
+        // `project_src` value.
+        assert!(
+            workspace_override_is_rescope(
+                &state.reader,
+                Some("no-such-workspace"),
+                state.workspace_id
+            )
+            .await,
+            "an unresolvable workspace override must fail closed and disqualify sticky"
+        );
     }
 
     // `sticky` extends out-of-tree inheritance to every strategy, but must
@@ -4637,10 +4785,22 @@ mod tests {
     /// host hook tagging each `project` override by provenance, and report
     /// where the second observation landed. The shared fixture behind the
     /// cross-repo cases below (#394).
+    ///
+    /// `workspace`, when set, is forwarded on BOTH events — mirroring every
+    /// real marker-covered install, where `workspace` is a required marker
+    /// key and rides along with every event under the marker's tree whether
+    /// or not the agent actually changed workspace (#976). Before #976 this
+    /// fixture never set `workspace` at all, which is exactly why the bug —
+    /// a marker's mandatory `workspace` unconditionally disqualifying sticky
+    /// — went untested: none of the cross-repo cases below ever exercised a
+    /// marker's workspace key riding alongside a repo-root-derived project,
+    /// which is exactly the combination every real marker-covered install
+    /// sends.
     async fn cross_repo_cd(
         state: &HookState,
         sid: &str,
         source: &str,
+        workspace: Option<&str>,
     ) -> (ProjectId, Option<ProjectId>) {
         let fire = |event: &str, cwd: &str, project: &str, project_src: Option<&str>| {
             HookEnvelope::from_query_and_body(
@@ -4648,6 +4808,7 @@ mod tests {
                     event: event.into(),
                     agent: Some("claude-code".into()),
                     cwd: Some(cwd.to_string()),
+                    workspace: workspace.map(str::to_owned),
                     project: Some(project.to_string()),
                     project_src: project_src.map(str::to_owned),
                     project_strategy: Some("repo-root".into()),
@@ -4697,6 +4858,15 @@ mod tests {
     // hop into a sibling checkout keeps the session's project: the override
     // is host-derived (`project_src=repo-root`), so it carries no operator
     // intent and yields to the session.
+    //
+    // Also issue #976's regression case: BOTH events carry `workspace=default`
+    // (matching `state.workspace_id`'s name, per `make_state`), exactly as a
+    // real marker-covered install forwards its required `workspace` key on
+    // every event under the marker's tree — the same workspace the session
+    // is already in. Before the #976 fix, `workspace_override.is_some()`
+    // alone disqualified sticky here, so this exact test would have failed
+    // (see `mid_session_out_of_tree_cwd_still_resolves_per_event_under_basename`-
+    // style per-event splitting) had the fixture ever forwarded `workspace`.
     #[tokio::test]
     async fn sticky_routing_keeps_the_session_project_across_a_sibling_checkout() {
         let tmp = TempDir::new().unwrap();
@@ -4711,7 +4881,7 @@ mod tests {
             .unwrap();
         assert_eq!(repo_a, None, "fixture starts clean");
 
-        let (landed, repo_b) = cross_repo_cd(&state, sid, "repo-root").await;
+        let (landed, repo_b) = cross_repo_cd(&state, sid, "repo-root", Some("default")).await;
         let repo_a = state
             .reader
             .find_project(state.workspace_id, "repo-a".to_string())
@@ -4742,7 +4912,7 @@ mod tests {
         );
         let sid = "88888888-8888-4888-8888-888888888888";
 
-        let (landed, repo_b) = cross_repo_cd(&state, sid, "repo-root").await;
+        let (landed, repo_b) = cross_repo_cd(&state, sid, "repo-root", Some("default")).await;
         let repo_b = repo_b.expect("follow-cwd mints the visited checkout's project");
         assert_eq!(
             landed, repo_b,
@@ -4760,11 +4930,108 @@ mod tests {
         state.mid_session_routing = MidSessionRouting::Sticky;
         let sid = "99999999-9999-4999-8999-999999999999";
 
-        let (landed, repo_b) = cross_repo_cd(&state, sid, "marker").await;
+        let (landed, repo_b) = cross_repo_cd(&state, sid, "marker", Some("default")).await;
         let repo_b = repo_b.expect("a marker-declared project must still be created");
         assert_eq!(
             landed, repo_b,
             "a marker override is a deliberate rescope and outranks stickiness"
+        );
+    }
+
+    // Issue #976's opposite-direction case, left untested before this fix: a
+    // marker naming a genuinely DIFFERENT workspace than the session's own
+    // must still rescope, even under `sticky`. Only "same workspace, still
+    // here" may fall through to the project-provenance logic above — a real
+    // workspace change is not drift and must never be captured by
+    // stickiness.
+    #[tokio::test]
+    async fn sticky_routing_still_rescopes_when_marker_names_a_different_workspace_mid_session() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.mid_session_routing = MidSessionRouting::Sticky;
+        // Pre-create the target workspace so the mid-session event's lookup
+        // resolves to a real, distinct WorkspaceId (the `Ok(resolved) !=
+        // session_workspace` branch) instead of accidentally only exercising
+        // the fail-closed "unresolvable name" branch, which would also
+        // disqualify stickiness but for the wrong reason and leave the
+        // resolved-and-different comparison unproven at this level.
+        state
+            .writer
+            .get_or_create_workspace("other-workspace")
+            .await
+            .unwrap();
+        let sid = "cdcdcdcd-cdcd-4cdc-8cdc-cdcdcdcdcdcd";
+        let fire = |event: &str, cwd: &str, project: &str, workspace: &str| {
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    cwd: Some(cwd.to_string()),
+                    workspace: Some(workspace.to_string()),
+                    project: Some(project.to_string()),
+                    project_src: Some("repo-root".into()),
+                    project_strategy: Some("repo-root".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": sid,
+                    "cwd": cwd,
+                    "tool_name": "Bash",
+                }),
+            )
+        };
+
+        process(
+            &state,
+            fire("session-start", "/checkouts/repo-a", "repo-a", "default"),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            fire(
+                "post-tool-use",
+                "/checkouts/repo-b",
+                "repo-b",
+                "other-workspace",
+            ),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let session_id: SessionId = sid.parse().unwrap();
+        let observations = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+        assert_eq!(observations.len(), 2);
+        let other_ws = state
+            .reader
+            .find_workspace("other-workspace".to_string())
+            .await
+            .unwrap()
+            .expect(
+                "a genuinely different workspace override must still resolve/create its own workspace",
+            );
+        let repo_b_in_other_ws = state
+            .reader
+            .find_project(other_ws, "repo-b".to_string())
+            .await
+            .unwrap()
+            .expect("the rescoped event's project must exist in the NEW workspace");
+        let second = observations.last().unwrap();
+        assert_eq!(
+            second.project_id, repo_b_in_other_ws,
+            "a marker naming a genuinely different workspace must still rescope, even under sticky"
+        );
+        assert_ne!(
+            second.workspace_id, state.workspace_id,
+            "the rescoped event must not stay in the session's original workspace"
         );
     }
 
@@ -4943,6 +5210,7 @@ mod tests {
         let pending_obs = || {
             Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id: ws,
                     project_id: proj,
@@ -7531,6 +7799,7 @@ mod tests {
                     .insert_observation_ingest(
                         Sanitized::new(
                             NewObservation {
+                                occurred_at: None,
                                 session_id,
                                 workspace_id: state.workspace_id,
                                 project_id: state.project_id,
@@ -8372,6 +8641,7 @@ mod tests {
             state
                 .writer
                 .begin_session(NewSession {
+                    occurred_at: None,
                     id,
                     workspace_id: state.workspace_id,
                     project_id,
@@ -8472,6 +8742,7 @@ mod tests {
             state
                 .writer
                 .begin_session(NewSession {
+                    occurred_at: None,
                     id,
                     workspace_id: state.workspace_id,
                     project_id,
@@ -9614,6 +9885,7 @@ mod tests {
         state
             .writer
             .begin_session(NewSession {
+                occurred_at: None,
                 id: sid,
                 workspace_id: state.workspace_id,
                 project_id: target,
@@ -9753,6 +10025,7 @@ mod tests {
         let pending_observation = || {
             Sanitized::new(
                 NewObservation {
+                    occurred_at: None,
                     session_id,
                     workspace_id,
                     project_id,
@@ -10242,6 +10515,7 @@ mod tests {
             state
                 .writer
                 .begin_session(NewSession {
+                    occurred_at: None,
                     id: session_id,
                     workspace_id: state.workspace_id,
                     project_id: state.project_id,
@@ -11117,6 +11391,94 @@ mod tests {
         assert_ne!(
             proj_basename, proj_override,
             "project override must produce a different ProjectId than basename(cwd)"
+        );
+    }
+
+    /// A Windows cwd whose basename carries uppercase letters must resolve
+    /// to the SAME project the CLI would (which keeps the raw basename), not
+    /// a lowercased twin. `normalize_project_path_key` folds the whole
+    /// drive-letter path, so deriving the name from the normalized cwd used
+    /// to mint "default project" beside the CLI's "Default Project" for one
+    /// folder (#871). The cache key must stay case-folded so #806 handoff
+    /// stickiness is not regressed.
+    #[tokio::test]
+    async fn windows_casing_does_not_split_project() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let cwd_win = r"D:\path\to\Default Project";
+
+        // What the CLI derives for the same raw cwd (original case).
+        let (cli_name, _) = ai_memory_consolidate::derive_project_name(
+            std::path::Path::new(cwd_win),
+            ai_memory_consolidate::ProjectNameStrategy::Basename,
+        )
+        .expect("CLI derives a basename for a Windows path");
+        assert_eq!(cli_name, "Default Project");
+
+        let (_, proj_hook) = resolve_project_ids(
+            &state,
+            Some(cwd_win),
+            None,
+            None,
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+
+        // The hook-derived project must equal the one the CLI's name maps to.
+        let (_, proj_cli) = resolve_project_ids(
+            &state,
+            Some(cwd_win),
+            None,
+            Some(&cli_name),
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            proj_hook, proj_cli,
+            "hook must resolve the case-preserved CLI project, not a lowercased twin"
+        );
+
+        // Prove it bites: the lowercased name is a *different* project.
+        let (_, proj_lower) = resolve_project_ids(
+            &state,
+            Some(cwd_win),
+            None,
+            Some("default project"),
+            ProjectStrategy::Basename,
+            &ai_memory_core::ActorKey::default(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            proj_hook, proj_lower,
+            "case-folded basename must NOT be the project the hook resolves"
+        );
+
+        // Paired assertion: the cache key stays case-folded (repo_path /
+        // stickiness namespace unchanged) even though the NAME is preserved.
+        let cache = state.project_cache.lock().await;
+        let strat = ProjectStrategy::Basename.as_str().to_string();
+        assert!(
+            cache.contains_key(&(
+                "d:/path/to/default project".to_string(),
+                String::new(),
+                String::new(),
+                strat.clone(),
+            )),
+            "cache key must remain case-folded for #806 stickiness"
+        );
+        assert!(
+            !cache.contains_key(&(
+                "D:/path/to/Default Project".to_string(),
+                String::new(),
+                String::new(),
+                strat,
+            )),
+            "cache key must not carry the original-case basename"
         );
     }
 
@@ -12030,6 +12392,70 @@ mod tests {
         }
     }
 
+    /// Regression for #980: a secret straddling the old 80-char `title_hint`
+    /// cutoff survived in `observations.title` unredacted, because
+    /// `payload::truncate_for_title` used to cut the prompt to 80 chars
+    /// *before* the sanitizer ever ran — often leaving too short a fragment
+    /// to match a pattern (built-in or `[sanitize] extra_patterns`). The fix
+    /// removed truncation from `title_hint` construction entirely; the
+    /// 80-char cap now runs in `Sanitized::new`, after `Sanitizer::scrub`.
+    ///
+    /// Before the fix: the stored title contains a raw, unmatched fragment of
+    /// the secret and no `[REDACTED:…]` marker at all, because the sanitizer
+    /// only ever saw the truncated 8-character prefix `SECRETZZ` — too short
+    /// for the `{20,}`-length pattern below. After the fix: the full secret
+    /// reaches the sanitizer first, gets replaced with the marker, and the
+    /// (much shorter) redacted title is what gets capped at 80 chars.
+    #[tokio::test]
+    async fn issue_980_user_prompt_title_is_sanitized_before_truncated() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = make_state(&tmp).await;
+        state.sanitizer = Sanitizer::new(&SanitizeConfig {
+            extra_patterns: vec![r"SECRET[0-9A-Za-z]{20,}".into()],
+            allowlist: Vec::new(),
+        })
+        .unwrap();
+        let secret = format!("SECRET{}", "Z".repeat(30));
+        let prompt = format!("{} {secret}", "x".repeat(70));
+        let sid = SessionId::new();
+        let env = HookEnvelope::from_query_and_body(
+            HookQuery {
+                event: "user-prompt".into(),
+                agent: Some("claude-code".into()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "session_id": sid.to_string(),
+                "cwd": "/repo",
+                "prompt": prompt,
+            }),
+        );
+        process(&state, env, None, Vec::new()).await.unwrap();
+
+        let observations = state.reader.observations_for_session(sid).await.unwrap();
+        let obs = observations
+            .iter()
+            .find(|o| o.kind == ObservationKind::UserPrompt)
+            .expect("user prompt observation was recorded");
+
+        assert!(
+            !obs.title.contains(&secret),
+            "full raw secret leaked into title: {:?}",
+            obs.title
+        );
+        assert!(
+            obs.title.contains("REDACT"),
+            "title carries no trace of redaction \u{2014} the sanitizer never \
+             saw enough of the secret to match it: {:?}",
+            obs.title
+        );
+        assert!(
+            obs.title.chars().count() <= 80,
+            "title exceeded the 80-char display cap: {:?}",
+            obs.title
+        );
+    }
+
     #[test]
     fn codex_native_patch_capture_backstop_discards_unproven_output() {
         for protocol in [
@@ -12108,6 +12534,157 @@ mod tests {
             raw.clone(),
         );
         assert_eq!(inspect_capture_envelope(env).unwrap().raw, raw);
+    }
+
+    #[test]
+    fn capture_protocol_shell_decisions_survive_server_reinspection() {
+        // The server never sees the client's patterns, so its direct
+        // re-inspection of a shell command must accept the client's Keep
+        // unchanged and treat the client's Drop as terminal.
+        let query = || HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let kept = serde_json::json!({
+            "session_id": "shell-keep", "tool_name": "Bash",
+            "tool_input": { "command": "cat src/main.rs *.md" },
+            "_ai_memory_capture": capture_protocol("keep", "active", "non-file", 0, "extracted"),
+        });
+        let env = HookEnvelope::from_query_and_body(query(), kept.clone());
+        assert_eq!(inspect_capture_envelope(env).unwrap().raw, kept);
+
+        let dropped = serde_json::json!({
+            "session_id": "shell-drop", "tool_name": "Bash",
+            "tool_input": { "command": "cat docs/adr/0001.md" },
+            "tool_response": "SENTINEL_SECRET",
+            "_ai_memory_capture": capture_protocol("drop", "active", "non-file", 0, "extracted"),
+        });
+        let env = HookEnvelope::from_query_and_body(query(), dropped);
+        assert!(inspect_capture_envelope(env).is_none());
+    }
+
+    #[test]
+    fn capture_protocol_invalid_marker_shell_is_metadata_only() {
+        let query = || HookQuery {
+            event: "post-tool-use".into(),
+            agent: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let stripped = |state: &str| {
+            serde_json::json!({
+                "session_id": "shell-invalid", "cwd": "/repo",
+                "tool_family": "non-file", "tool_name": "non-file",
+                "_ai_memory_capture": capture_protocol("metadata-only", state, "non-file", 0, "extracted"),
+            })
+        };
+        // What a current client sends under a broken marker is accepted.
+        let env = inspect_capture_envelope(HookEnvelope::from_query_and_body(
+            query(),
+            stripped("invalid"),
+        ))
+        .unwrap();
+        assert_eq!(
+            env.raw["_ai_memory_capture"]["disposition"],
+            "metadata-only"
+        );
+        assert_eq!(env.raw["tool_family"], "non-file");
+
+        // An active policy decides a shell call outright, so a metadata-only
+        // claim for one is impossible and refused.
+        assert!(
+            inspect_capture_envelope(HookEnvelope::from_query_and_body(
+                query(),
+                stripped("active")
+            ))
+            .is_none()
+        );
+
+        // An older client that still keeps the command under a broken marker
+        // is stripped by the server's own re-inspection.
+        let kept = serde_json::json!({
+            "session_id": "shell-invalid-keep", "tool_name": "Bash",
+            "tool_input": { "command": "cat /PRIVATE_PATH_SENTINEL/x.md" },
+            "tool_response": "SENTINEL_SECRET",
+            "_ai_memory_capture": capture_protocol("keep", "invalid", "non-file", 0, "extracted"),
+        });
+        let env =
+            inspect_capture_envelope(HookEnvelope::from_query_and_body(query(), kept)).unwrap();
+        assert_eq!(
+            env.raw["_ai_memory_capture"]["disposition"],
+            "metadata-only"
+        );
+        let stored = serde_json::to_string(&env).unwrap();
+        assert!(!stored.contains("SENTINEL"), "{stored}");
+
+        // Control: a non-file tool with no command keeps its body.
+        let search = serde_json::json!({
+            "session_id": "web-search-invalid", "tool_name": "web_search",
+            "tool_input": { "query": "docs" },
+            "_ai_memory_capture": capture_protocol("keep", "invalid", "non-file", 0, "extracted"),
+        });
+        let env =
+            inspect_capture_envelope(HookEnvelope::from_query_and_body(query(), search.clone()))
+                .unwrap();
+        assert_eq!(env.raw, search);
+    }
+
+    #[test]
+    fn capture_protocol_invalid_shell_metadata_claim_must_be_canonical() {
+        let admit = |path_count: u16, extraction: &str| {
+            inspect_capture_envelope(HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": "shell-claim", "cwd": "/repo",
+                    "tool_family": "non-file", "tool_name": "non-file",
+                    "_ai_memory_capture": capture_protocol(
+                        "metadata-only", "invalid", "non-file", path_count, extraction),
+                }),
+            ))
+            .is_some()
+        };
+        assert!(admit(0, "extracted"), "control: what a real client sends");
+        assert!(!admit(60_000, "extracted"), "invented path count");
+        assert!(!admit(1, "extracted"), "non-file bodies carry no paths");
+        assert!(!admit(0, "missing-or-malformed"), "file-only extraction");
+        assert!(!admit(0, "not-applicable"), "search-only extraction");
+    }
+
+    #[test]
+    fn capture_protocol_unparseable_marker_strips_shell_events() {
+        for marker in [
+            serde_json::json!("garbage"),
+            serde_json::json!({"version": 99}),
+            {
+                let mut future = capture_protocol("keep", "invalid", "non-file", 0, "extracted");
+                future["version"] = serde_json::json!(2);
+                future
+            },
+        ] {
+            let env = HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: "post-tool-use".into(),
+                    agent: Some("claude-code".into()),
+                    ..Default::default()
+                },
+                serde_json::json!({
+                    "session_id": "shell-unparseable", "cwd": "/repo",
+                    "tool_name": "Bash",
+                    "tool_input": { "command": "cat docs/adr/secret.md" },
+                    "tool_response": "SENTINEL_SECRET",
+                    "_ai_memory_capture": marker,
+                }),
+            );
+            let stored = inspect_capture_envelope(env).map(|env| env.raw.to_string());
+            assert!(
+                stored.is_none_or(|stored| !stored.contains("SENTINEL_SECRET")),
+                "shell output survived an unparseable marker"
+            );
+        }
     }
 
     #[test]
@@ -12853,6 +13430,29 @@ mod tests {
         assert!(q[1].contains("working tree"), "got: {q:?}");
     }
 
+    /// The same file-activity heuristic, but for the *majority* spelling: every
+    /// closed-tool agent stores `safe_tool_title`'s `"tool file"`, not the bare
+    /// `canonical_tool_name` `"file"` of the reserved-protocol path. Before
+    /// #895 this spelling never matched, so the heuristic was dead for almost
+    /// every real session.
+    #[test]
+    fn open_questions_detects_abnormal_exit_after_prefixed_file_activity() {
+        let obs = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool file",
+                "tool_family: file\noutcome: unknown",
+            ),
+            // No Stop observation — session ended mid-task.
+        ];
+        let last = Some("fix the bug".to_string());
+        let q = derive_open_questions(&obs, &last);
+        assert_eq!(q.len(), 2, "got: {q:?}");
+        assert!(q[0].contains("without a normal stop"), "got: {q:?}");
+        assert!(q[1].contains("working tree"), "got: {q:?}");
+    }
+
     /// Guard against the regression this heuristic already had once: only
     /// titles the ingest path can actually produce may drive it, so a raw
     /// tool name must NOT trigger the file branch.
@@ -12870,6 +13470,66 @@ mod tests {
                  drive the file heuristic; got: {q:?}"
             );
         }
+    }
+
+    /// An automatic handoff built only from closed-tool observations (whose
+    /// titles are `safe_tool_title`'s `"tool file"` / `"tool non-file"` family
+    /// labels) must NOT emit a `Tools used:` line: a family is a partition of
+    /// the calls, not a name for a tool, so the label leaks nothing useful into
+    /// the handoff. A real tool name still produces the line (#895).
+    #[test]
+    fn auto_handoff_omits_tool_family_labels_from_tools_used() {
+        use ai_memory_core::{ProjectId, WorkspaceId};
+        let observations = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool file",
+                "tool_family: file\noutcome: unknown",
+            ),
+            mk_obs(
+                ObservationKind::PostToolUse,
+                "tool non-file",
+                "tool_family: non-file\noutcome: success",
+            ),
+        ];
+        let handoff = build_auto_handoff(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            AgentKind::ClaudeCode,
+            SessionId::new(),
+            None,
+            &observations,
+            None,
+        );
+        assert!(
+            handoff
+                .next_steps
+                .iter()
+                .all(|s| !s.starts_with("Tools used:")),
+            "family labels must not surface as a Tools used line; got: {:?}",
+            handoff.next_steps
+        );
+
+        // Control: a real harness tool name still produces the line.
+        let with_real_tool = vec![
+            mk_obs(ObservationKind::UserPrompt, "fix bug", "fix the bug"),
+            mk_obs(ObservationKind::PostToolUse, "Edit", "edited main.rs"),
+        ];
+        let handoff = build_auto_handoff(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            AgentKind::ClaudeCode,
+            SessionId::new(),
+            None,
+            &with_real_tool,
+            None,
+        );
+        assert!(
+            handoff.next_steps.iter().any(|s| s == "Tools used: Edit"),
+            "a real tool name must still be listed; got: {:?}",
+            handoff.next_steps
+        );
     }
 
     /// A search/list tool is file-adjacent but not file activity; it must
@@ -12976,5 +13636,111 @@ mod tests {
         assert!(is_acknowledgment("谢谢"));
         assert!(!is_acknowledgment("fix the bug in main.rs"));
         assert!(!is_acknowledgment("what is the return type?"));
+    }
+
+    /// End-to-end proof that a client-supplied `occurred_at` reaches every
+    /// timestamp column it is supposed to via the real `/hook` ingest path
+    /// (`process_authorized` -> `admit_hook_session_event` for the session
+    /// row, `insert_observation*` for the observation), not just the
+    /// lower-level store functions those handlers call. `admit_hook_session_event`
+    /// creates the `sessions` row on its own INSERT, separate from
+    /// `begin_session_row`, so this is the path a real backfilled
+    /// session-start actually takes.
+    #[tokio::test]
+    async fn hook_occurred_at_stamps_session_and_observation_times_end_to_end() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp).await;
+        let session = "occurred-at-e2e";
+        let start_at = "2025-09-10T12:00:00Z";
+        let prompt_at = "2025-09-10T12:01:00Z";
+        let end_at = "2025-09-10T12:05:00Z";
+        let envelope = |event: &str, occurred_at: &str, prompt: Option<&str>| {
+            let mut body = serde_json::json!({
+                "session_id": session,
+                "occurred_at": occurred_at,
+            });
+            if let Some(prompt) = prompt {
+                body["prompt"] = serde_json::json!(prompt);
+            }
+            HookEnvelope::from_query_and_body(
+                HookQuery {
+                    event: event.into(),
+                    agent: Some("claude-code".into()),
+                    workspace: Some("default".into()),
+                    project: Some("scratch".into()),
+                    ..Default::default()
+                },
+                body,
+            )
+        };
+
+        process(
+            &state,
+            envelope("session-start", start_at, None),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            envelope("user-prompt-submit", prompt_at, Some("backfilled prompt")),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        process(
+            &state,
+            envelope("session-end", end_at, None),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        let session_id = resolve_native_session_id(session);
+        let summary = state
+            .reader
+            .session_summary_scoped(
+                state.workspace_id,
+                state.project_id,
+                session_id,
+                ai_memory_core::OwnerFilter::Any,
+            )
+            .await
+            .unwrap()
+            .expect("session row exists");
+        let expected_start = start_at.parse::<jiff::Timestamp>().unwrap().to_string();
+        let expected_end = end_at.parse::<jiff::Timestamp>().unwrap().to_string();
+        assert_eq!(
+            summary.started_at, expected_start,
+            "started_at must come from the session-start event's occurred_at, \
+             not import time (admit_hook_session_event's own INSERT)"
+        );
+        assert_eq!(
+            summary.ended_at.as_deref(),
+            Some(expected_end.as_str()),
+            "ended_at must come from the session-end event's occurred_at"
+        );
+        assert!(
+            summary.started_at <= expected_end,
+            "a backfilled session must not end before it starts"
+        );
+
+        let observations = state
+            .reader
+            .observations_for_session(session_id)
+            .await
+            .unwrap();
+        let prompt_obs = observations
+            .iter()
+            .find(|o| o.body == "backfilled prompt")
+            .expect("the user-prompt observation was recorded");
+        let expected_prompt_at = prompt_at.parse::<jiff::Timestamp>().unwrap();
+        assert_eq!(
+            prompt_obs.created_at, expected_prompt_at,
+            "created_at must come from the observation's own occurred_at"
+        );
     }
 }

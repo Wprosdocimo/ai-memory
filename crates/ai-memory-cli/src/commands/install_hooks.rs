@@ -454,7 +454,13 @@ pub fn run(config: &Config, mut args: InstallHooksArgs) -> Result<()> {
     // to. Mismatch between `--as-user` and the actual token's owner is
     // the operator's concern; we don't reach back to the server to
     // verify (keeps install-hooks offline-capable).
-    validate_as_user(args.as_user.as_deref(), auth)?;
+    //
+    // Validate against the resolved token, not the rendered one. `auth` is
+    // deliberately `None` on the #552 secure path — the token was persisted
+    // under the data dir for the hooks to read — so passing it here made
+    // `--apply --as-user X --auth-token T` bail on the very combination
+    // docs/users.md recommends, with a message saying the token was absent.
+    validate_as_user(args.as_user.as_deref(), auth_token_owned.as_deref())?;
     if let Some(user) = args.as_user.as_deref().filter(|s| !s.trim().is_empty()) {
         eprintln!("[ai-memory] hooks installing for user: {user}");
     }
@@ -3471,6 +3477,52 @@ pub(crate) const TS_TOML_FLAG: &str = r#"function tomlFlag(text: string, key: st
   return undefined;
 }"#;
 
+/// `repoRootProject`, shared by every generated TypeScript integration: the
+/// project is named after the git repository that owns `cwd` (the main
+/// checkout, so linked worktrees share it).
+///
+/// `applyMarkerParams` calls it on every captured event, and two synchronous
+/// git spawns cost tens of milliseconds of host event loop each time, so the
+/// answer is memoized per `cwd` for as long as the generated state lives: the
+/// host process for the module-level integrations, one `setup()` instance for
+/// OpenCode 2. A miss (not a repo, git absent) is cached too; a directory
+/// that becomes a repo later resolves after the plugin reloads.
+///
+/// `windowsHide` keeps each spawn from flashing a console window when the
+/// host has none (OpenCode 2 runs plugins in a console-less background
+/// service), the TS counterpart of the native drain's `CREATE_NO_WINDOW`.
+pub(crate) const TS_REPO_ROOT_PROJECT: &str = r#"const repoProjectCache = new Map<string, string | undefined>();
+
+function repoRootProject(cwd: string | undefined): string | undefined {
+  if (!cwd) return undefined;
+  if (repoProjectCache.has(cwd)) return repoProjectCache.get(cwd);
+  const project = gitRepoProject(cwd);
+  repoProjectCache.set(cwd, project);
+  return project;
+}
+
+function gitRepoProject(cwd: string): string | undefined {
+  try {
+    const inside = execFileSync("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+    }).trim();
+    if (inside !== "true") return undefined;
+    const common = execFileSync("git", ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+    }).trim();
+    if (!common) return undefined;
+    const root = dirname(common);
+    if (!root || root === dirname(root)) return undefined;
+    return basename(root);
+  } catch (_e) {
+    return undefined;
+  }
+}"#;
+
 /// Post-process a generated TypeScript integration so failed hook
 /// deliveries SPOOL instead of vanishing (#580). The shell hooks have
 /// spooled since day one; the TS plugins fire-and-forgot, so a laptop
@@ -3716,26 +3768,7 @@ function tomlKey(text: string, key: string): string | undefined {{
 }}
 
 
-function repoRootProject(cwd: string | undefined): string | undefined {{
-  if (!cwd) return undefined;
-  try {{
-    const inside = execFileSync("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], {{
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }}).trim();
-    if (inside !== "true") return undefined;
-    const common = execFileSync("git", ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"], {{
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }}).trim();
-    if (!common) return undefined;
-    const root = dirname(common);
-    if (!root || root === dirname(root)) return undefined;
-    return basename(root);
-  }} catch (_e) {{
-    return undefined;
-  }}
-}}
+{TS_REPO_ROOT_PROJECT}
 {apply_marker_params}
 
 function sessionID(input: unknown): string | undefined {{
@@ -4461,26 +4494,7 @@ function tomlKey(text: string, key: string): string | undefined {{
 }}
 
 
-function repoRootProject(cwd: string | undefined): string | undefined {{
-  if (!cwd) return undefined;
-  try {{
-    const inside = execFileSync("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], {{
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }}).trim();
-    if (inside !== "true") return undefined;
-    const common = execFileSync("git", ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"], {{
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }}).trim();
-    if (!common) return undefined;
-    const root = dirname(common);
-    if (!root || root === dirname(root)) return undefined;
-    return basename(root);
-  }} catch (_e) {{
-    return undefined;
-  }}
-}}
+{TS_REPO_ROOT_PROJECT}
 {apply_marker_params}
 
 function sessionID(ctx: any): string | undefined {{
@@ -7988,6 +8002,53 @@ model = "gpt-5"
         );
     }
 
+    /// #993 regression guard: `--apply --as-user X --auth-token T` is the
+    /// command docs/users.md tells operators to run, and it failed on every
+    /// native install. The guard was handed the rendered credential, which is
+    /// `None` precisely when the token was persisted (#552), so it reported the
+    /// token as missing while the token sat under the data dir. The unit tests
+    /// on `validate_as_user` itself could not see it — the wiring was wrong,
+    /// not the function.
+    #[test]
+    fn apply_with_as_user_succeeds_when_the_token_is_persisted() {
+        let home = TempDir::new().unwrap();
+        let cfg_dir = TempDir::new().unwrap();
+        let settings = cfg_dir.path().join("settings.json");
+        std::fs::write(&settings, "{}").unwrap();
+
+        let config = crate::config::Config::load(None, Some(home.path().to_path_buf())).unwrap();
+
+        let args = InstallHooksArgs {
+            agent: AgentChoice::ClaudeCode,
+            apply: true,
+            server_url: Some("http://127.0.0.1:49374".to_string()),
+            auth_token: Some("ALICE-KEY-993".to_string()),
+            as_user: Some("alice".to_string()),
+            config_file: Some(settings.clone()),
+            hooks_dir: Some(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hooks"),
+            ),
+            ..default_hook_args()
+        };
+
+        // The whole point of the fix: persisting the token must not turn a
+        // present `--auth-token` into an "absent" one for the `--as-user` guard.
+        run(&config, args).expect("install-hooks --apply --as-user with a token must succeed");
+
+        // And the attribution it promised is real: the token is on disk for the
+        // hooks, and still absent from the agent's own config.
+        assert_eq!(
+            crate::config::read_hook_auth_token(&config.data_dir).as_deref(),
+            Some("ALICE-KEY-993"),
+            "alice's key must be persisted where the hook reads it"
+        );
+        let rendered = std::fs::read_to_string(&settings).unwrap();
+        assert!(
+            !rendered.contains("ALICE-KEY-993"),
+            "the bearer must not reach the agent config: {rendered}"
+        );
+    }
+
     /// F5 (docker-wrapper audit), the regression guard: when the bearer
     /// *cannot* be persisted under the data dir, `--apply` must still install
     /// working hooks by embedding the credential inline instead of aborting the
@@ -8432,6 +8493,8 @@ model = "gpt-5"
         assert!(plugin.contains("if (existsSync(join(probe, \".git\")))"));
         assert!(plugin.contains("boundary ??= dir;"));
         assert!(plugin.contains("function repoRootProject"));
+        assert!(plugin.contains("repoProjectCache.set(cwd, project);"));
+        assert_eq!(plugin.matches("windowsHide: true").count(), 2);
         assert!(plugin.contains("--git-common-dir"));
         assert!(
             plugin
@@ -8749,6 +8812,8 @@ model = "gpt-5"
         assert!(extension.contains("boundary ??= dir;"));
         assert!(extension.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(extension.contains("function repoRootProject"));
+        assert!(extension.contains("repoProjectCache.set(cwd, project);"));
+        assert_eq!(extension.matches("windowsHide: true").count(), 2);
         assert!(extension.contains("--git-common-dir"));
         assert!(
             extension
@@ -9200,6 +9265,8 @@ model = "gpt-5"
         assert!(extension.contains("tok"));
         assert!(extension.contains("import { execFileSync } from \"node:child_process\";"));
         assert!(!extension.contains(".omp"));
+        assert!(extension.contains("repoProjectCache.set(cwd, project);"));
+        assert_eq!(extension.matches("windowsHide: true").count(), 2);
         assert!(!extension.contains("serve --transport stdio"));
         assert!(!extension.contains("serve --stdio"));
         // #676: the pi string-transform (api.on( -> pi.on() must still
