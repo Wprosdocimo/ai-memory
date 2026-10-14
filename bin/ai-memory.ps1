@@ -154,6 +154,7 @@ foreach ($Name in @(
     "AI_MEMORY_WORKSTREAM_ID",
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_CODE_SESSION_ID",
+    "MUSE_SESSION_ID",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_OAUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
@@ -170,6 +171,30 @@ foreach ($Name in @(
     "RUST_LOG"
 )) {
     if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($Name))) {
+        $DockerArgs += @("-e", $Name)
+    }
+}
+
+# Presence-based, not non-empty-based like the loop above: an operator sets
+# one of these to the empty string to deliberately clear a
+# config.toml-configured prefix without editing the file (see
+# Config::load's figment overlay), and a present-but-empty value must reach
+# the container for that to work — `IsNullOrEmpty` above would drop it,
+# making the wrapper indistinguishable from the variable never having been
+# set at all. `GetEnvironmentVariable` returns `$null` only when the
+# variable is truly unset, and `""` when it is set-but-empty, so a `-ne
+# $null` check is exactly the presence test needed here.
+#
+# An operator's own `$env:NAME = ''` additionally needs PowerShell 7.5+
+# (first built on .NET 9) to leave a set-but-empty variable rather than
+# deleting it; not exercised on a real pwsh runtime.
+# https://learn.microsoft.com/en-us/dotnet/api/system.environment.setenvironmentvariable
+# https://learn.microsoft.com/en-us/powershell/scripting/whats-new/what-s-new-in-powershell-75
+foreach ($Name in @(
+    "AI_MEMORY_EMBEDDING_QUERY_PREFIX",
+    "AI_MEMORY_EMBEDDING_DOCUMENT_PREFIX"
+)) {
+    if ($null -ne [Environment]::GetEnvironmentVariable($Name)) {
         $DockerArgs += @("-e", $Name)
     }
 }

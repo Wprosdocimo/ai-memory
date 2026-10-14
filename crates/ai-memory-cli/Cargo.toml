@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "`ai-memory` binary entry point."
@@ -48,6 +49,7 @@ dirs.workspace = true
 figment.workspace = true
 flate2.workspace = true
 fs2.workspace = true
+libc.workspace = true
 # `transport-streamable-http-client-reqwest` pulls reqwest in with no TLS backend
 # (`__reqwest = ["dep:reqwest"]` and nothing more), so the bridge could not reach an
 # `https://` MCP server at all.
@@ -76,6 +78,7 @@ serde_json.workspace = true
 toml_edit.workspace = true
 sysinfo.workspace = true
 tar.workspace = true
+zip.workspace = true
 jiff.workspace = true
 jsonc-parser.workspace = true
 tokio.workspace = true
@@ -93,6 +96,7 @@ tempfile.workspace = true
 ai-memory-test-support.workspace = true
 tempfile.workspace = true
 rstest.workspace = true
+rusqlite.workspace = true
 tower.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
