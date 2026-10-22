@@ -86,6 +86,10 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
       "as_of",
       "answer",
       "reasoning",
+      "kind",
+      "tier",
+      "path_prefix",
+      "tag",
     ],
   },
   memory_status: { status: "wrapped", methods: ["status"], phase: 1, sends: [...SCOPE] },
@@ -190,6 +194,10 @@ export const TOOL_COVERAGE: Readonly<Record<string, ToolClassification>> = {
   memory_install_self_routing: {
     status: "not_exposed",
     reason: "writes coding-agent instruction files; specific to harnesses",
+  },
+  memory_restore_page: {
+    status: "not_exposed",
+    reason: "admin-only restore of one page from a git checkpoint; use callTool",
   },
 };
 

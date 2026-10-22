@@ -29,6 +29,7 @@ mod logging;
 mod marker;
 mod process_guard;
 mod server_profiles;
+mod terminal;
 
 use cli::{Cli, Command};
 use config::Config;
@@ -88,6 +89,9 @@ pub async fn run() -> Result<()> {
     match command {
         Command::Init(args) => commands::init::run(&config, args, config_path.as_deref()),
         Command::Setup(args) => commands::setup::run(&config, args, config_path.as_deref()).await,
+        Command::ServiceHost(args) => {
+            commands::service_host::run(&config, args, config_path.as_deref()).await
+        }
         Command::Status(args) => commands::status::run(&config, args).await,
         Command::ListProjects(args) => commands::list_projects::run(&config, args).await,
         Command::Doctor(args) => commands::doctor::run(&config, args).await,
@@ -132,6 +136,7 @@ pub async fn run() -> Result<()> {
             commands::audit_contamination::run(&config, args).await
         }
         Command::Search(args) => commands::search::run(&config, args).await,
+        Command::Recent(args) => commands::recent::run(&config, args).await,
         Command::ReadPage(args) => commands::read_page::run(&config, args).await,
         Command::WritePage(args) => commands::write_page::run(&config, args).await,
         Command::DeletePage(args) => commands::delete_page::run(&config, args).await,
@@ -144,7 +149,7 @@ pub async fn run() -> Result<()> {
         Command::Backup(args) => commands::backup::run(&config, args).await,
         Command::BackupAgents(args) => commands::backup_agents::run(&config, args),
         Command::ExportOkf(args) => commands::export_okf::run(&config, args).await,
-        Command::Restore(args) => commands::restore::run(&config, args),
+        Command::Restore(args) => commands::restore::run(&config, args).await,
         Command::RestoreAgents(args) => commands::restore_agents::run(&config, args),
         Command::Reindex(args) => commands::reindex::run(&config, args).await,
         Command::InstallHooks(args) => commands::install_hooks::run(&config, args),

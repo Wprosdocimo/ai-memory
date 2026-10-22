@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ai_memory_consolidate::{
-    AutoImproveReviewConfig, Consolidator, ObservationRetention, projection::cap_text_with_marker,
-    run_auto_improve_review, run_lint, run_sweep_with_compaction,
+    AutoImproveReviewConfig, ColdClusterDedup, Consolidator, LedgerRetention, ObservationRetention,
+    projection::cap_text_with_marker, run_auto_improve_review, run_lint, run_sweep_with_ledgers,
 };
 use ai_memory_core::{
     ActiveProject, AgentKind, FeedbackKind, HandoffId, HandoffState, NewHandoff, PageId, PagePath,
@@ -218,7 +218,10 @@ again, and say which you applied.\n\
   `superseded: true`. Pass `pin_first=true` to prepend the project's \
   bounded pinned latest pages ahead of the search hits (deduped, each \
   marked `pinned: true`) when standing operator-curated context should be \
-  seen before the ranked matches. Pass `answer=true` (opt-in, off by \
+  seen before the ranked matches. Use `kind`, `tier`, literal `path_prefix`, \
+  and exact `tag` to narrow page candidates before ranking; filtered misses \
+  intentionally omit raw observations because they have no page metadata. \
+  Pass `answer=true` (opt-in, off by \
   default, and only when the server has an LLM provider) to also synthesize \
   a cited natural-language answer over the top hits, attached as \
   `answer: { text, citations }`; with no provider it returns the hits plus \
@@ -381,15 +384,27 @@ should be proposed from a completed session, or at explicit wrap-up \
 - `memory_read_session_observations` — when the user asks what actually \
   happened in a session, wants to check a compiled page against its raw \
   evidence, or needs the exact prompt/tool text behind a `memory_query` \
-  raw hit. Pass `session_id`, or omit it for the latest completed session \
-  in the current project; page with `limit`/`offset`, narrow with `kinds` \
-  or `query`. Read-only, no LLM call.\n\
+  raw hit. Also the first read when the user asks to continue and a \
+  session-start notice, `memory_briefing` `recent_sessions` or \
+  `memory_handoff_list` `newer_unended_session` names a session that never \
+  ended (a harness cut off by a quota limit or a crash): read it with \
+  `order: \"desc\"` before relying on an older handoff or page. Pass \
+  `session_id` (the UUID or the harness's native id), or omit it for the \
+  newest other session with work in the current project (your cwd first, \
+  ended or not); page with \
+  `limit`/`offset`, narrow with `kinds` or `query`. Read-only, no LLM call.\n\
 - `memory_delete_page` — when the user explicitly asks to delete or \
   remove a specific page (by exact path). Idempotent; fires the \
   admission chain so mirrors/backups stay consistent. Follow the client-aware \
   project-scope rule above; missing explicit sibling scopes fail closed \
   instead of falling back. Pass `expected_page_id` to delete only the \
   version you read.\n\
+- `memory_restore_page` — when the user asks to undo a page change or \
+  bring back a deleted page. Admin only (implicit on a single-operator \
+  server); project pages only, not `scope: \"profile\"` pages. Without \
+  `rev` it lists the page's checkpoints; with `rev` it writes that version, \
+  frontmatter included, back through the `memory_write_page` path. Follow \
+  the client-aware project-scope rule above.\n\
 - `memory_feedback` — right after a `memory_query` / `memory_read_page` \
   hit proves useful or misleading, and whenever the user says a recalled \
   page is out of date or wrong. Pass the exact `path` from the hit plus \
@@ -403,9 +418,15 @@ should be proposed from a completed session, or at explicit wrap-up \
 - `memory_lint` — when the user asks to audit the wiki for stale \
   pages, contradictions, or rule suggestions.\n\
 - `memory_forget_sweep` — when the user wants to prune old / cold \
-  pages. Three passes: expired pages are hard-deleted even when \
+  pages. Five passes: expired pages are hard-deleted even when \
   pinned, cold episodic pages decay to tombstones (pinned exempt), \
-  old tombstones are purged (idempotent, supports dry-run).\n\
+  old tombstones are purged, old raw observations are pruned, and \
+  old hook event ledgers (log-YYYY-MM.md) are deleted — the last two \
+  only when their opt-in retention is configured (decay \
+  `observation_retention_days` / `ledger_retention_months`), and the \
+  ledger pass never touches the current or previous month. \
+  Idempotent; `dry_run=true` reports what every pass would delete \
+  without deleting anything.\n\
 - `memory_install_self_routing` — when the user asks to 'install \
   ai-memory routing into this project' or 'add ai-memory to \
   CLAUDE.md / AGENTS.md'. Returns the managed routing package: the \
@@ -497,6 +518,9 @@ pub struct AiMemoryServer {
     /// Opt-in bound on how long raw observations outlive their consolidation.
     /// Default is disabled, so `memory_forget_sweep` deletes no raw capture.
     observation_retention: ObservationRetention,
+    /// Opt-in age bound for the hook event ledgers. Default is disabled, so
+    /// `memory_forget_sweep` deletes no ledger file.
+    ledger_retention: LedgerRetention,
     /// A2 opt-in: compact cold episodic pages (tier-down) instead of evicting
     /// them. Default `false`, so the sweep evicts exactly as before.
     compact_cold_episodic: bool,
@@ -593,6 +617,8 @@ pub struct AiMemoryServer {
 }
 
 const MAX_QUERY_SCOPES: usize = 25;
+const MAX_QUERY_PATH_PREFIX_LEN: usize = 1_024;
+const MAX_QUERY_TAG_LEN: usize = 128;
 
 /// Upper bound on how many pinned latest pages `memory_query(pin_first=true)`
 /// prepends, so standing context never crowds out the search result entirely.
@@ -614,6 +640,22 @@ struct QueryArgs {
     /// Maximum number of hits to return (default 10, max 100).
     #[serde(default, alias = "n", alias = "top_k")]
     limit: Option<usize>,
+    /// Keep only pages of this semantic kind (ASCII case-insensitive).
+    /// Custom kinds are accepted. Applied before ranking.
+    #[serde(default)]
+    kind: Option<String>,
+    /// Keep only pages in this memory tier: `working`, `episodic`,
+    /// `semantic`, or `procedural`. Applied before ranking.
+    #[serde(default)]
+    tier: Option<String>,
+    /// Keep only pages whose project-relative path starts with this literal
+    /// prefix. `%`, `_`, and backslash have no wildcard meaning.
+    #[serde(default)]
+    path_prefix: Option<String>,
+    /// Keep only pages whose frontmatter `tags` array contains this exact
+    /// string (ASCII case-insensitive). Applied before ranking.
+    #[serde(default)]
+    tag: Option<String>,
     /// Project to search. Session-aware clients may omit it for the current
     /// project. Static MCP clients must pass it together with `workspace` for
     /// every project-scoped call. Omit it for `global=true`.
@@ -799,6 +841,61 @@ struct ProjectSearchOptions<'a> {
     /// The caller's session-timeline owner filter: observation excerpts come
     /// only from sessions it admits.
     owner: &'a ai_memory_core::OwnerFilter,
+    filter: ai_memory_store::PageFilter<'a>,
+}
+
+fn bounded_query_filter<'a>(
+    name: &str,
+    value: Option<&'a str>,
+    max_len: usize,
+) -> Result<Option<&'a str>, McpError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.chars().take(max_len + 1).count() > max_len || value.chars().any(char::is_control) {
+        return Err(McpError::invalid_params(
+            format!(
+                "{name} must be at most {max_len} characters and contain no control characters"
+            ),
+            None,
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn query_page_filter(args: &QueryArgs) -> Result<ai_memory_store::PageFilter<'_>, McpError> {
+    let kind = bounded_query_filter(
+        "kind",
+        args.kind.as_deref(),
+        ai_memory_core::page::MAX_PAGE_KIND_LEN,
+    )?;
+    let path_prefix = bounded_query_filter(
+        "path_prefix",
+        args.path_prefix.as_deref(),
+        MAX_QUERY_PATH_PREFIX_LEN,
+    )?;
+    let tag = bounded_query_filter("tag", args.tag.as_deref(), MAX_QUERY_TAG_LEN)?;
+    let tier = match bounded_query_filter("tier", args.tier.as_deref(), 16)? {
+        Some(value) => Some(
+            ai_memory_core::Tier::ALL
+                .iter()
+                .find(|tier| tier.as_str().eq_ignore_ascii_case(value))
+                .map(ai_memory_core::Tier::as_str)
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "tier must be working, episodic, semantic or procedural",
+                        None,
+                    )
+                })?,
+        ),
+        None => None,
+    };
+    Ok(ai_memory_store::PageFilter {
+        kind,
+        tier,
+        path_prefix,
+        tag,
+    })
 }
 
 /// Borrow an embedded query as the store's vector-stream input.
@@ -932,10 +1029,29 @@ struct StatusResponse {
 struct BriefingResponse {
     #[serde(flatten)]
     snapshot: ai_memory_store::BriefingSnapshot,
+    /// Sessions with the newest captured work, newest first. A session
+    /// with `ended: false` that is not `current` was cut off or is still
+    /// running elsewhere; its observations are where the work stopped.
+    recent_sessions: Vec<RecentSession>,
     /// Which project the briefing describes — the inbox `pending_message_count`
     /// counts, so the agent can pop it by name.
     scope: AnsweredScope,
 }
+
+/// One entry of [`BriefingResponse::recent_sessions`].
+#[derive(Debug, Serialize)]
+struct RecentSession {
+    #[serde(flatten)]
+    activity: ai_memory_store::SessionActivity,
+    /// The caller's own session, when the client forwards its session id.
+    current: bool,
+}
+
+/// How many sessions `memory_briefing` lists in `recent_sessions`, and how
+/// far back it looks.
+const BRIEFING_RECENT_SESSIONS: usize = 5;
+const BRIEFING_RECENT_SESSIONS_WINDOW: jiff::SignedDuration =
+    jiff::SignedDuration::from_hours(30 * 24);
 
 /// The scope a response was answered from. Without it an unscoped call that
 /// fell back to another project returns plausible numbers the caller has no
@@ -1596,13 +1712,20 @@ const SESSION_OBSERVATIONS_MAX_LIMIT: usize = 200;
 const SESSION_OBSERVATIONS_DEFAULT_BODY_CHARS: usize = 4_000;
 const SESSION_OBSERVATIONS_MIN_BODY_CHARS: usize = 200;
 const SESSION_OBSERVATIONS_MAX_BODY_CHARS: usize = 16_384;
+/// Sessions with recent work the default read scans for one in the caller's
+/// cwd. The list is ordered by activity, so it stays small.
+const SESSION_OBSERVATIONS_DEFAULT_SCAN: usize = 16;
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct ReadSessionObservationsArgs {
-    /// Session id (UUID) to read, typically taken from a `memory_query`
-    /// raw hit, `memory_briefing`, or an admin session listing. Omit to
-    /// read the most recent COMPLETED session visible to you in the
-    /// resolved project.
+    /// Session id to read: the UUID from a `memory_query` raw hit,
+    /// `memory_briefing`'s `recent_sessions`, a session-start notice or an
+    /// admin session listing, or the harness's own native id (an OpenCode
+    /// `ses_…` id, for example), which maps to the same session. Omit to
+    /// read the session with the newest captured work visible to you in the
+    /// resolved project, ended or cut off, other than your own: one in your
+    /// own cwd first, then any. With no work in the last 30 days, the latest
+    /// completed session.
     #[serde(default)]
     session_id: Option<String>,
     /// Maximum observations per call (default 50, max 200).
@@ -1666,6 +1789,59 @@ struct DeletePageArgs {
     /// delete.
     #[serde(default)]
     expected_page_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct RestorePageArgs {
+    /// Exact wiki path to restore or inspect (e.g. `notes/foo.md`).
+    path: String,
+    /// Checkpoint commit to restore from, as listed by a call without `rev`
+    /// (the newest one is the change being undone). Omit it to
+    /// list the checkpoints that changed this page.
+    #[serde(default)]
+    rev: Option<String>,
+    /// Maximum checkpoints to list when `rev` is omitted (default 20, max 100).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Project of the page. Static MCP clients must pass it together with
+    /// `workspace` on every project-scoped call.
+    #[serde(default)]
+    project: Option<String>,
+    /// Workspace of the page, together with `project`.
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+/// The page metadata a checkpoint's frontmatter carries, in the shape
+/// `memory_write_page` takes, so a restore keeps `kind`, `entities`,
+/// `abstract`, `relations` and the profile fields instead of clearing them.
+/// The write path validates them again with the same bounds as any write.
+fn checkpoint_write_metadata(
+    frontmatter: &serde_json::Value,
+) -> Result<ai_memory_core::page::PageWriteMetadata, McpError> {
+    const KEYS: [&str; 6] = [
+        "kind",
+        "entities",
+        "abstract",
+        "relations",
+        "applies_to",
+        "enforced_by",
+    ];
+    let picked: serde_json::Map<String, serde_json::Value> = KEYS
+        .iter()
+        .filter_map(|key| {
+            frontmatter
+                .get(*key)
+                .filter(|value| !value.is_null())
+                .map(|value| ((*key).to_owned(), value.clone()))
+        })
+        .collect();
+    serde_json::from_value(serde_json::Value::Object(picked)).map_err(|e| {
+        McpError::invalid_params(
+            format!("the checkpoint's page metadata cannot be restored as written: {e}"),
+            None,
+        )
+    })
 }
 
 /// Write one durable wiki page. Optional metadata (`kind`, `entities`,
@@ -1830,6 +2006,7 @@ impl AiMemoryServer {
             decay_params: DecayParams::default(),
             decay_breadth_weight: 0.0,
             observation_retention: ObservationRetention::default(),
+            ledger_retention: LedgerRetention::default(),
             compact_cold_episodic: false,
             contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
@@ -2008,6 +2185,26 @@ impl AiMemoryServer {
             })
             .or_else(|| header_session("mcp-session-id"));
         ai_memory_core::ActorKey { user, session_id }
+    }
+
+    /// The `limit` sessions with the newest captured work in one scope, for
+    /// `memory_briefing`'s `recent_sessions`, `memory_handoff_list`'s
+    /// `newer_unended_session` and `memory_read_session_observations`'
+    /// default session.
+    async fn recent_sessions(
+        &self,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        owner_filter: ai_memory_core::OwnerFilter,
+        limit: usize,
+    ) -> Result<Vec<ai_memory_store::SessionActivity>, McpError> {
+        let since = jiff::Timestamp::now()
+            .saturating_sub(BRIEFING_RECENT_SESSIONS_WINDOW)
+            .unwrap_or(jiff::Timestamp::MIN);
+        self.reader
+            .recent_session_activity(ws, proj, owner_filter, since, limit)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
 
     /// Resolve which `(workspace_id, project_id)` a read tool should
@@ -2437,6 +2634,7 @@ impl AiMemoryServer {
                     include_superseded: options.include_superseded,
                     explain: options.explain,
                     owner: options.owner,
+                    filter: options.filter,
                 },
             )
             .await
@@ -2563,8 +2761,19 @@ impl AiMemoryServer {
         self
     }
 
-    /// Attach the wiki handle. Without this, `memory_forget_sweep`
-    /// and `memory_lint` cannot write their report pages.
+    /// Set the opt-in event ledger age bound used by `memory_forget_sweep`.
+    /// Unset, the sweep never deletes a ledger file.
+    #[must_use]
+    pub fn with_ledger_retention(mut self, retention: LedgerRetention) -> Self {
+        self.ledger_retention = retention;
+        self
+    }
+
+    /// Attach the wiki handle. Without this, `memory_lint` returns an
+    /// error, and `memory_forget_sweep` refuses every pass that
+    /// deletes or rewrites a page (TTL, decay eviction, compaction,
+    /// cold-cluster dedup) and skips tombstone cleanup and the event-ledger
+    /// pass; only the observation prune still runs.
     #[must_use]
     pub fn with_wiki(mut self, wiki: Wiki) -> Self {
         self.wiki = Some(wiki);
@@ -2612,14 +2821,21 @@ impl AiMemoryServer {
         followed by a bounded kind/tier/pinned/tag source-authority adjustment. \
         Returns up to `limit` pages with HTML-marked snippets and a rank \
         score (lower rank = better match). Only latest page versions. \
+        Query text is folded (a NUL becomes a space) and bounded to the \
+        first 4 KiB before parsing, so pasting a whole document searches \
+        only its opening. \
         Set `explain=true` to attach per-stream ranks, matched entities, raw \
         scores, RRF contributions, graph provenance, and the authority multiplier to \
         project/scopes hits; it also returns `streams_active` and per-stream \
         `timings` in milliseconds. \
         Cross-project `global=true` search is FTS-only and therefore reports \
         `streams_active` without per-hit RRF details. \
+        Optional `kind`, `tier`, literal `path_prefix`, and exact `tag` \
+        filters narrow page candidates before ranking in every search mode. \
         If compiled wiki search misses in default/project/`scopes` mode, \
         `raw_hits` contains bounded raw observation fallback matches; \
+        filtered searches omit this fallback because observations do not carry \
+        page metadata. \
         `global=true` searches compiled wiki pages only and returns no raw \
         fallback. Single-project calls (project implicit or named with \
         `workspace`+`project`) also return \
@@ -2643,6 +2859,8 @@ impl AiMemoryServer {
         let include_expired = args.include_expired.unwrap_or(false);
         let include_superseded = args.include_superseded.unwrap_or(false);
         let explain = args.explain.unwrap_or(false);
+        let filter = query_page_filter(&args)?;
+        let filtered = filter.is_active();
         // A repo that opted into `[recall] default_global` (published on the
         // ActiveProject by the hook) makes a query with NO explicit scoping
         // behave as `global=true`. Precedence is strict: an explicit
@@ -2650,8 +2868,21 @@ impl AiMemoryServer {
         // this only fires when the caller passed none of them.
         let explicit_scoping = !args.scopes.is_empty()
             || named_scope_args_present(args.workspace.as_deref(), args.project.as_deref());
+        // A non-blank `as_of` is explicit intent to read one project as of an
+        // instant. The global branch below returns its own response, so an
+        // explicit `global` or `scopes` is refused here, before that branch,
+        // and an implicit `default_global` broadening yields to `as_of` the
+        // way the precedence note above says an explicit arg does.
+        let as_of_present = args.as_of.as_deref().is_some_and(|s| !s.trim().is_empty());
+        if as_of_present && (args.global.unwrap_or(false) || !args.scopes.is_empty()) {
+            return Err(McpError::invalid_params(
+                "as_of cannot be combined with global or scopes",
+                None,
+            ));
+        }
         let recall_global = !explicit_scoping
             && !args.global.unwrap_or(false)
+            && !as_of_present
             && self.active_project.default_global_for(&aps_actor);
         if args.global.unwrap_or(false) || recall_global {
             if !args.scopes.is_empty()
@@ -2664,7 +2895,7 @@ impl AiMemoryServer {
                     .as_deref()
                     .is_some_and(|s| !s.trim().is_empty())
             {
-                return Err(McpError::internal_error(
+                return Err(McpError::invalid_params(
                     "global cannot be combined with workspace/project/scopes",
                     None,
                 ));
@@ -2677,6 +2908,7 @@ impl AiMemoryServer {
                     limit,
                     include_expired.then_some(i64::MIN),
                     Self::viewer_from_parts(Some(&parts)),
+                    filter,
                 )
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -2708,7 +2940,7 @@ impl AiMemoryServer {
                     .as_deref()
                     .is_some_and(|s| !s.trim().is_empty()))
         {
-            return Err(McpError::internal_error(
+            return Err(McpError::invalid_params(
                 "scopes cannot be combined with workspace/project",
                 None,
             ));
@@ -2720,14 +2952,8 @@ impl AiMemoryServer {
         // RRF. Vector, graph, and the raw-observation fallback stay out
         // of audit mode.
         if let Some(raw_as_of) = args.as_of.as_deref().filter(|s| !s.trim().is_empty()) {
-            if args.global.unwrap_or(false) || !args.scopes.is_empty() {
-                return Err(McpError::internal_error(
-                    "as_of cannot be combined with global or scopes",
-                    None,
-                ));
-            }
             let instant: jiff::Timestamp = raw_as_of.trim().parse().map_err(|e| {
-                McpError::internal_error(format!("as_of must be an ISO-8601 instant: {e}"), None)
+                McpError::invalid_params(format!("as_of must be an ISO-8601 instant: {e}"), None)
             })?;
             let (ws, proj) = self
                 .effective_ids_for_read_args_with_actor(
@@ -2739,13 +2965,14 @@ impl AiMemoryServer {
                 .await?;
             let fused = self
                 .reader
-                .search_pages_for_project_at(
+                .search_pages_for_project_at_filtered(
                     ws,
                     proj,
                     args.query.clone(),
                     limit,
                     instant.as_microsecond(),
                     explain,
+                    filter,
                 )
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -2798,6 +3025,7 @@ impl AiMemoryServer {
             explain,
             include_superseded,
             owner: &owner_filter,
+            filter,
         };
         let hits = if let Some(scopes) = &resolved_scopes {
             self.search_scopes(scopes, options).await
@@ -2832,7 +3060,7 @@ impl AiMemoryServer {
         // for explicit `scopes` — the recommended scope-bleed mitigation —
         // by searching observations in each resolved (ws, proj) and
         // rank-merging, so the fallback isn't lost on the scoped path.
-        let raw_hits = if !hits.is_empty() {
+        let raw_hits = if !hits.is_empty() || filtered {
             Vec::new()
         } else if let Some(scopes) = &resolved_scopes {
             let mut obs: Vec<ai_memory_store::ObservationHit> = Vec::new();
@@ -2917,6 +3145,7 @@ impl AiMemoryServer {
                                     explain,
                                     include_superseded,
                                     owner: &owner_filter,
+                                    filter,
                                 },
                             )
                             .await
@@ -2987,6 +3216,7 @@ impl AiMemoryServer {
                                     explain,
                                     include_superseded,
                                     owner: &owner_filter,
+                                    filter,
                                 },
                             )
                             .await
@@ -3033,7 +3263,7 @@ impl AiMemoryServer {
                 .await?;
             let pins = self
                 .reader
-                .list_pinned_pages(ws, proj, limit.min(PIN_FIRST_MAX))
+                .list_pinned_pages_filtered(ws, proj, limit.min(PIN_FIRST_MAX), filter)
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
             if pins.is_empty() {
@@ -3064,9 +3294,12 @@ impl AiMemoryServer {
                         &global_scope_hits,
                         args.reasoning.unwrap_or_default(),
                     );
-                    match ai_memory_llm::complete_structured::<AnswerSynthesis>(
+                    match ai_memory_llm::complete_structured_with_operation_id::<AnswerSynthesis>(
                         llm.as_ref(),
                         request,
+                        ai_memory_llm::LlmOperationId::for_workload(
+                            ai_memory_llm::LlmWorkload::QueryAnswer,
+                        ),
                     )
                     .await
                     {
@@ -3540,7 +3773,7 @@ impl AiMemoryServer {
             idempotent_hint = true,
             open_world_hint = false
         ),
-        description = "Run the retention sweep. FOUR passes, and they \
+        description = "Run the retention sweep. FIVE passes, and they \
         differ on what they will delete. (1) TTL: pages whose frontmatter \
         expires_at is in the past are hard-deleted (file + rows) REGARDLESS \
         OF TIER OR PIN — an explicit expiry overrides a pin, so a pinned \
@@ -3557,9 +3790,15 @@ impl AiMemoryServer {
         page that is still live — an unconsolidated session, or one whose \
         page pass 2 or 3 just removed, keeps every row. This pass is DISABLED \
         by default (observation_retention_days = 0) and deletes nothing until \
-        an operator opts in; when off, observations_pruned is 0. The report's \
-        expired / hard_deleted / observations_pruned counts come from passes \
-        1, 3 and 4. Pass dry_run=true to preview."
+        an operator opts in; when off, observations_pruned is 0. (5) Event \
+        ledgers: hook event ledger files (log-YYYY-MM.md) whose month ended \
+        at least decay.ledger_retention_months whole months ago are deleted \
+        from disk permanently (never the current or previous month, never a \
+        file that does not open like a ledger). DISABLED by default \
+        (ledger_retention_months = 0); when off, ledgers_pruned is 0. The \
+        report's expired / hard_deleted / observations_pruned counts come \
+        from passes 1, 3 and 4; ledgers_prunable / ledgers_pruned and their \
+        byte counts from pass 5. Pass dry_run=true to preview."
     )]
     async fn memory_forget_sweep(
         &self,
@@ -3579,7 +3818,7 @@ impl AiMemoryServer {
                 Self::viewer_from_parts(Some(&parts)),
             )
             .await?;
-        let report = run_sweep_with_compaction(
+        let report = run_sweep_with_ledgers(
             &self.reader,
             &self.writer,
             self.wiki.as_ref(),
@@ -3589,6 +3828,8 @@ impl AiMemoryServer {
             self.decay_breadth_weight,
             self.observation_retention,
             self.compact_cold_episodic,
+            ColdClusterDedup::default(),
+            self.ledger_retention,
             args.dry_run.unwrap_or(false),
         )
         .await
@@ -3991,7 +4232,13 @@ impl AiMemoryServer {
                 None,
             ));
         };
-        let session_id = match args.session_id.as_deref() {
+        // Blank means omitted, as in `memory_consolidate`.
+        let session_id = match args
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        {
             Some(raw) => SessionId::from_str(raw)
                 .map_err(|e| McpError::invalid_params(e.to_string(), None))?,
             None => self
@@ -4000,7 +4247,7 @@ impl AiMemoryServer {
                 .await
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?
                 .ok_or_else(|| {
-                    McpError::internal_error(
+                    McpError::invalid_params(
                         "no completed session without an auto-improvement run found for the resolved project; pass session_id to rerun a specific session",
                         None,
                     )
@@ -4284,6 +4531,18 @@ impl AiMemoryServer {
         Parameters(args): Parameters<WritePageArgs>,
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
+        self.write_page_in_scope(args, parts, None).await
+    }
+
+    /// The body of [`Self::memory_write_page`]. `resolved` is a scope the
+    /// caller already resolved and authorized (`memory_restore_page` resolves
+    /// once and must write where it read); `None` resolves from `args`.
+    async fn write_page_in_scope(
+        &self,
+        args: WritePageArgs,
+        parts: axum::http::request::Parts,
+        resolved: Option<ai_memory_store::ResolvedWriteScope>,
+    ) -> Result<CallToolResult, McpError> {
         let metadata = args
             .metadata
             .into_frontmatter()
@@ -4307,9 +4566,9 @@ impl AiMemoryServer {
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
         let precondition = page_precondition(args.expected_page_id.as_deref(), args.create_only)?;
         let path = PagePath::new(args.path.clone())
-            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+            .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
         path.ensure_portable()
-            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+            .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
         let path = self.place_slot_write(path, &parts).await?;
         let scope = args.scope.as_deref().map(str::trim);
         let profile_scope = scope == Some("profile");
@@ -4340,7 +4599,7 @@ impl AiMemoryServer {
                 .unwrap_or(if session_page { "episodic" } else { "semantic" });
         let tier: Tier = tier_name
             .parse()
-            .map_err(|_| McpError::internal_error(format!("unknown tier '{tier_name}'"), None))?;
+            .map_err(|_| McpError::invalid_params(format!("unknown tier '{tier_name}'"), None))?;
         if let Some(expires_at) = args
             .expires_at
             .as_deref()
@@ -4359,74 +4618,77 @@ impl AiMemoryServer {
                 None,
             ));
         }
-        let resolved_scope = match args.scope.as_deref().map(str::trim) {
-            None | Some("") => {
-                self.resolve_write_target_with_actor(
-                    args.workspace.as_deref(),
-                    args.project.as_deref(),
-                    &aps_actor,
-                    Self::viewer_from_parts(Some(&parts)),
-                )
-                .await?
-            }
-            Some("global") => {
-                if args
-                    .workspace
-                    .as_deref()
-                    .is_some_and(|s| !s.trim().is_empty())
-                    || args
-                        .project
+        let resolved_scope = match resolved {
+            Some(resolved) => resolved,
+            None => match args.scope.as_deref().map(str::trim) {
+                None | Some("") => {
+                    self.resolve_write_target_with_actor(
+                        args.workspace.as_deref(),
+                        args.project.as_deref(),
+                        &aps_actor,
+                        Self::viewer_from_parts(Some(&parts)),
+                    )
+                    .await?
+                }
+                Some("global") => {
+                    if args
+                        .workspace
                         .as_deref()
                         .is_some_and(|s| !s.trim().is_empty())
-                {
-                    return Err(McpError::internal_error(
-                        "scope: \"global\" cannot be combined with workspace/project",
+                        || args
+                            .project
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty())
+                    {
+                        return Err(McpError::invalid_params(
+                            "scope: \"global\" cannot be combined with workspace/project",
+                            None,
+                        ));
+                    }
+                    // The same resolver and choke point as an explicit
+                    // `default/_global` write, so both spellings are gated alike.
+                    self.resolve_write_target_with_actor(
+                        Some(ai_memory_core::DEFAULT_WORKSPACE_NAME),
+                        Some(ai_memory_core::GLOBAL_SCOPE_PROJECT),
+                        &aps_actor,
+                        Self::viewer_from_parts(Some(&parts)),
+                    )
+                    .await?
+                }
+                Some("profile") => {
+                    if args
+                        .workspace
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty())
+                        || args
+                            .project
+                            .as_deref()
+                            .is_some_and(|s| !s.trim().is_empty())
+                    {
+                        return Err(McpError::invalid_params(
+                            "scope: \"profile\" cannot be combined with workspace/project",
+                            None,
+                        ));
+                    }
+                    let (workspace_id, project_id) =
+                        self.profile_target_ids(&parts, &aps_actor, true).await?;
+                    ai_memory_store::ResolvedWriteScope {
+                        scope: ai_memory_store::ResolvedScope {
+                            workspace_id,
+                            project_id,
+                        },
+                        promoted_from: None,
+                    }
+                }
+                Some(other) => {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "unknown scope '{other}': the supported values are \"global\" and \"profile\""
+                        ),
                         None,
                     ));
                 }
-                // The same resolver and choke point as an explicit
-                // `default/_global` write, so both spellings are gated alike.
-                self.resolve_write_target_with_actor(
-                    Some(ai_memory_core::DEFAULT_WORKSPACE_NAME),
-                    Some(ai_memory_core::GLOBAL_SCOPE_PROJECT),
-                    &aps_actor,
-                    Self::viewer_from_parts(Some(&parts)),
-                )
-                .await?
-            }
-            Some("profile") => {
-                if args
-                    .workspace
-                    .as_deref()
-                    .is_some_and(|s| !s.trim().is_empty())
-                    || args
-                        .project
-                        .as_deref()
-                        .is_some_and(|s| !s.trim().is_empty())
-                {
-                    return Err(McpError::internal_error(
-                        "scope: \"profile\" cannot be combined with workspace/project",
-                        None,
-                    ));
-                }
-                let (workspace_id, project_id) =
-                    self.profile_target_ids(&parts, &aps_actor, true).await?;
-                ai_memory_store::ResolvedWriteScope {
-                    scope: ai_memory_store::ResolvedScope {
-                        workspace_id,
-                        project_id,
-                    },
-                    promoted_from: None,
-                }
-            }
-            Some(other) => {
-                return Err(McpError::internal_error(
-                    format!(
-                        "unknown scope '{other}': the supported values are \"global\" and \"profile\""
-                    ),
-                    None,
-                ));
-            }
+            },
         };
         let (ws, proj) = resolved_scope.scope.as_tuple();
         let manifest_warning = self.refresh_promoted_scope(&resolved_scope).await;
@@ -4604,7 +4866,9 @@ impl AiMemoryServer {
         this when the user asks to read, open, or show a specific page by \
         name or topic — not just snippets. Returns `{ path, title, body, \
         frontmatter }` (plus `served_from` when a missing markdown file is \
-        served from the DB fallback). \
+        served from the DB fallback, and `expired: true` when the page's \
+        `expires_at` TTL has passed: an exact-path read still returns such a \
+        page, which `memory_query` and `memory_recent` no longer surface). \
         \
         Set `include_related: true` to also walk the link graph outward from \
         this page and get a `related` array of the reachable pages, each with \
@@ -4649,7 +4913,7 @@ impl AiMemoryServer {
 
         let page_path = if let Some(p) = args.path {
             PagePath::new(p)
-                .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?
+                .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?
         } else if let Some(query) = args.query {
             let hits = self
                 .reader
@@ -4685,8 +4949,8 @@ impl AiMemoryServer {
         //
         // Opt-in related-pages walk. Computed once against the resolved scope so
         // both the disk and DB-fallback branches attach the same `related`
-        // block; default off → `attach_related` is a no-op and the response
-        // stays byte-identical to a plain single-page read.
+        // block; default off → `annotate` adds nothing and the response stays
+        // byte-identical to a plain single-page read.
         let related = if args.include_related {
             let depth = args.related_depth.unwrap_or(1);
             Some(
@@ -4704,12 +4968,27 @@ impl AiMemoryServer {
         } else {
             None
         };
-        let attach_related = |mut value: serde_json::Value| {
-            if let (Some(nodes), Some(map)) = (&related, value.as_object_mut()) {
-                map.insert(
-                    "related".into(),
-                    serde_json::to_value(nodes).unwrap_or(serde_json::Value::Null),
-                );
+        // An expired page is still returned (an explicit read is not a search)
+        // but says so: `memory_query`, `memory_recent` and the briefing hide
+        // it, so this flag is how a caller learns the page is only waiting for
+        // the forget sweep. Omitted while the page is live.
+        let expired = self
+            .reader
+            .page_expired_by_ids(ws, proj, page_path.as_str())
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .unwrap_or(false);
+        let annotate = |mut value: serde_json::Value| {
+            if let Some(map) = value.as_object_mut() {
+                if let Some(nodes) = &related {
+                    map.insert(
+                        "related".into(),
+                        serde_json::to_value(nodes).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+                if expired {
+                    map.insert("expired".into(), serde_json::Value::Bool(true));
+                }
             }
             value
         };
@@ -4744,7 +5023,7 @@ impl AiMemoryServer {
                 // frontmatter title was never filled otherwise read back
                 // titleless despite a proper `# Heading` (#599).
                 let title = ai_memory_wiki::derive_title(&md.frontmatter, &md.body, &page_path);
-                ok_json(&attach_related(serde_json::json!({
+                ok_json(&annotate(serde_json::json!({
                     "path": page_path.to_string(),
                     "page_id": page_id.map(|id| id.to_string()),
                     "title": title,
@@ -4768,7 +5047,7 @@ impl AiMemoryServer {
                             .and_then(|v| v.as_str())
                             .map(str::to_string)
                             .or(Some(stored.title));
-                        ok_json(&attach_related(serde_json::json!({
+                        ok_json(&annotate(serde_json::json!({
                             "path": page_path.to_string(),
                             "page_id": page_id.map(|id| id.to_string()),
                             "title": title,
@@ -4824,8 +5103,14 @@ impl AiMemoryServer {
         consolidation. Use when the user asks what actually happened in a \
         session, wants to audit or verify a compiled page against its \
         evidence, or needs the exact prompt/tool text behind a `memory_query` \
-        raw hit. Pass `session_id` (UUID); omit it to read the most recent \
-        completed session visible to you in the resolved project. Pages with \
+        raw hit, or to continue a session that was cut off without ending \
+        (a session-start notice, `memory_briefing` `recent_sessions` or \
+        `memory_handoff_list` `newer_unended_session` names it; read it with \
+        `order: \"desc\"`). Pass `session_id` (the UUID, or the harness's \
+        native id); omit it to read the session with the newest captured \
+        work visible to you in the resolved project, other than your own \
+        (one in your own cwd first; ended or not), or the latest completed \
+        one when nothing worked in the last 30 days. Pages with \
         `limit`/`offset` (default 50, max 200) and returns `total`, so loop on \
         `offset` to read more. `order` is `asc` (capture order) or `desc`; \
         `kinds` and `query` narrow the rows; `body_max_chars` (default 4000) \
@@ -4909,9 +5194,10 @@ impl AiMemoryServer {
         // uuid cannot probe across projects.
         let session = match args.session_id.as_deref().map(str::trim) {
             Some(raw) if !raw.is_empty() => {
-                let session_id = SessionId::from_str(raw).map_err(|_| {
-                    McpError::invalid_params(format!("invalid session id: {raw}"), None)
-                })?;
+                // The hooks store a native id that is not a UUID under its
+                // v5 mapping, so the same mapping finds it here. The scoped
+                // lookup below still decides visibility.
+                let session_id = SessionId::from_native(raw);
                 let summary = self
                     .reader
                     .session_summary_scoped(ws, proj, session_id, owner_filter)
@@ -4929,19 +5215,54 @@ impl AiMemoryServer {
                 }
             }
             _ => {
-                let mut latest = self
-                    .reader
-                    .sessions_for_scope(ws, proj, owner_filter, false, 1, 0)
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                match latest.pop() {
+                // The default follows the newest work, not the newest clean
+                // end: a harness cut off by a quota limit or a crash never
+                // ends, and the session taking its work over usually starts
+                // in the same checkout. So: the newest other session in the
+                // caller's cwd, then the newest other session in the scope,
+                // then (no other session worked inside the 30-day window)
+                // the latest completed one. The caller's own session is never the
+                // default; it knows its own work.
+                let caller = aps_actor.session_id.as_deref().map(SessionId::from_native);
+                let recent = self
+                    .recent_sessions(
+                        ws,
+                        proj,
+                        owner_filter.clone(),
+                        SESSION_OBSERVATIONS_DEFAULT_SCAN,
+                    )
+                    .await?;
+                let caller_cwd = recent
+                    .iter()
+                    .find(|activity| Some(activity.session_id) == caller)
+                    .and_then(|activity| activity.cwd.as_deref());
+                let others = || {
+                    recent
+                        .iter()
+                        .filter(|activity| Some(activity.session_id) != caller)
+                };
+                let newest = caller_cwd
+                    .and_then(|cwd| others().find(|activity| activity.cwd.as_deref() == Some(cwd)))
+                    .or_else(|| others().next());
+                let summary = match newest {
+                    Some(activity) => self
+                        .reader
+                        .session_summary_scoped(ws, proj, activity.session_id, owner_filter)
+                        .await
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+                    None => self
+                        .reader
+                        .sessions_for_scope(ws, proj, owner_filter, false, 1, 0)
+                        .await
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?
+                        .pop(),
+                };
+                match summary {
                     Some(summary) => summary,
                     None => {
                         let scope = self.scope_label(ws, proj).await;
                         return Err(McpError::invalid_params(
-                            format!(
-                                "no completed session in {scope}; pass session_id to read an open one"
-                            ),
+                            format!("no other session in {scope}; pass session_id to read one"),
                             None,
                         ));
                     }
@@ -4986,6 +5307,151 @@ impl AiMemoryServer {
         }))
     }
 
+    /// List a page's checkpoints, or restore it from one through the
+    /// normal write path.
+    #[tool(
+        annotations(
+            title = "Restore memory page",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        description = "Bring back an earlier version of a wiki page, \
+        including a deleted one. Admin only: the same authority as \
+        `/admin/restore-page`, because a checkpoint can hold text a root \
+        deleted, purged or let expire (implicit on a single-operator \
+        server). Without `rev`, lists the checkpoints that changed `path` \
+        (newest first): `{ path, checkpoints: [{ rev, summary, time }] }`. \
+        With `rev` (a listed checkpoint, or the checkpoint before a \
+        `memory_delete_page`), writes that version back, frontmatter \
+        included, as a new current version through the `memory_write_page` \
+        path, so sanitization, admission, attribution and supersession \
+        apply; the version it replaces stays reachable. Project pages only: \
+        `scope: \"profile\"` pages cannot be restored here. Pass \
+        `workspace` + `project` together on static clients. Use only when \
+        the user asks to restore or undo a page change."
+    )]
+    async fn memory_restore_page(
+        &self,
+        Parameters(args): Parameters<RestorePageArgs>,
+        OptionalParts(parts): OptionalParts,
+    ) -> Result<CallToolResult, McpError> {
+        // Git history keeps every version the live wiki dropped: pages a root
+        // deleted, purge-session removed or the forget sweep expired. Listing
+        // names those versions and restoring resurrects them, so both need
+        // `/admin/restore-page`'s authority, not a reader's or writer's grant.
+        self.require_admin_capability(&parts).await?;
+        let aps_actor = Self::actor_key_from_parts(Some(&parts));
+        let Some(wiki) = self.wiki.as_ref() else {
+            return Err(McpError::internal_error(
+                "memory_restore_page requires the server to be built with a wiki handle",
+                None,
+            ));
+        };
+        let path = PagePath::new(args.path.clone())
+            .and_then(|p| p.ensure_portable().map(|()| p))
+            .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
+        // Resolved once, no-create, for writing: the listing, the checkpoint
+        // read and the write all address this one project, so a moving
+        // active-project pointer cannot read from one project and write into
+        // another.
+        let (ws, proj) = self
+            .effective_ids_for_mutation_args_with_actor(
+                args.workspace.as_deref(),
+                args.project.as_deref(),
+                &aps_actor,
+                Self::viewer_from_parts(Some(&parts)),
+            )
+            .await?;
+
+        let Some(rev) = args.rev.as_deref().map(str::trim).filter(|r| !r.is_empty()) else {
+            let limit = args.limit.unwrap_or(20).clamp(1, 100);
+            let checkpoints = wiki
+                .page_checkpoints(ws, proj, &path, limit)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let checkpoints: Vec<_> = checkpoints
+                .into_iter()
+                .map(|c| serde_json::json!({ "rev": c.oid, "summary": c.summary, "time": c.time }))
+                .collect();
+            return ok_json(&serde_json::json!({
+                "path": path.to_string(),
+                "checkpoints": checkpoints,
+            }));
+        };
+
+        let md = wiki
+            .page_at_checkpoint(ws, proj, &path, rev)
+            .await
+            .map_err(|e| {
+                McpError::invalid_params(format!("cannot read {path} at {rev}: {e}"), None)
+            })?;
+        let fm = &md.frontmatter;
+        let metadata = checkpoint_write_metadata(fm)?;
+        let text = |key: &str| {
+            fm.get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        let tags = fm
+            .get("tags")
+            .and_then(serde_json::Value::as_array)
+            .map(|tags| {
+                tags.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let write = WritePageArgs {
+            metadata,
+            path: path.to_string(),
+            body: md.body,
+            title: text("title"),
+            tier: text("tier"),
+            tags,
+            pinned: fm
+                .get("pinned")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            project: args.project,
+            workspace: args.workspace,
+            scope: None,
+            expires_at: text("expires_at"),
+            session_id: None,
+            expected_page_id: None,
+            create_only: false,
+        };
+        let resolved = ai_memory_store::ResolvedWriteScope {
+            scope: ai_memory_store::ResolvedScope {
+                workspace_id: ws,
+                project_id: proj,
+            },
+            promoted_from: None,
+        };
+        let result = self
+            .write_page_in_scope(write, parts, Some(resolved))
+            .await?;
+        if result.is_error.unwrap_or(false) {
+            return Ok(result);
+        }
+        let written = serde_json::to_value(&result.content)
+            .ok()
+            .and_then(|content| content.get(0)?.get("text")?.as_str().map(str::to_owned))
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        match written {
+            Some(serde_json::Value::Object(mut map)) => {
+                map.insert(
+                    "restored_from".into(),
+                    serde_json::Value::String(rev.to_owned()),
+                );
+                ok_json(&map)
+            }
+            _ => Ok(result),
+        }
+    }
+
     /// Delete a single wiki page by exact path.
     #[tool(
         annotations(
@@ -5022,7 +5488,7 @@ impl AiMemoryServer {
             _ => None,
         };
         let path = PagePath::new(args.path.clone())
-            .map_err(|e| McpError::internal_error(format!("invalid path: {e}"), None))?;
+            .map_err(|e| McpError::invalid_params(format!("invalid path: {e}"), None))?;
         let (path, (ws, proj)) = match args.scope.as_deref().map(str::trim) {
             None | Some("") => (
                 self.place_slot_delete(path, &parts).await?,
@@ -5276,7 +5742,12 @@ impl AiMemoryServer {
         or when you need an exact id for memory_handoff_accept or \
         memory_handoff_cancel. After inspecting, claim one row with \
         memory_handoff_accept passing that `handoff_id` — handoffs remain \
-        SINGLE-USE. This is not a briefing or status tool. \
+        SINGLE-USE. This is not a briefing or status tool. When a session \
+        that never ended (cut off by a quota limit or a crash, or still \
+        running) holds newer work than every open handoff, the response \
+        also names it as `newer_unended_session`: read that session with \
+        memory_read_session_observations before relying on an older \
+        handoff. \
         \
         Follow the client-aware project-scope instructions: static clients \
         pass `workspace` + `project` together for every project-scoped call. \
@@ -5321,10 +5792,41 @@ impl AiMemoryServer {
         .unwrap_or(OPEN_HANDOFFS_DEFAULT_LIMIT as usize);
         let handoffs = self
             .reader
-            .list_handoffs(ws, proj, Some(HandoffState::Open), owner_filter, limit)
+            .list_handoffs(
+                ws,
+                proj,
+                Some(HandoffState::Open),
+                owner_filter.clone(),
+                limit,
+            )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        ok_json(&serde_json::json!({ "handoffs": handoffs }))
+        // A harness cut off without ending leaves no handoff, so the open ones
+        // can all predate where the work actually stopped. Name that session.
+        let caller = aps_actor.session_id.as_deref().map(SessionId::from_native);
+        let newest = self
+            .recent_sessions(ws, proj, owner_filter, BRIEFING_RECENT_SESSIONS)
+            .await?
+            .into_iter()
+            .find(|activity| Some(activity.session_id) != caller);
+        let newer_unended_session = newest.filter(|activity| {
+            !activity.ended
+                && !activity.handed_off
+                && handoffs.iter().all(|handoff| {
+                    handoff.lifecycle.created_at.as_microsecond() < activity.last_activity_us
+                })
+        });
+        match newer_unended_session {
+            Some(session) => ok_json(&serde_json::json!({
+                "handoffs": handoffs,
+                "newer_unended_session": session,
+                "hint": "The newest work in this project is in a session that never ended (cut \
+                         off, or still running) and is newer than every open handoff. To \
+                         continue where it stopped, read it with \
+                         memory_read_session_observations (that session_id, order \"desc\")."
+            })),
+            None => ok_json(&serde_json::json!({ "handoffs": handoffs })),
+        }
     }
 
     /// Fetch the latest open handoff for this project (optionally filtered
@@ -5395,7 +5897,7 @@ impl AiMemoryServer {
             .filter(|id| !id.is_empty())
             .map(|id| {
                 HandoffId::from_str(id)
-                    .map_err(|e| McpError::internal_error(format!("invalid handoff_id: {e}"), None))
+                    .map_err(|e| McpError::invalid_params(format!("invalid handoff_id: {e}"), None))
             })
             .transpose()?;
         let handoff = if let Some(handoff_id) = requested_id {
@@ -5529,8 +6031,8 @@ impl AiMemoryServer {
         OptionalParts(parts): OptionalParts,
     ) -> Result<CallToolResult, McpError> {
         let aps_actor = Self::actor_key_from_parts(Some(&parts));
-        let handoff_id = HandoffId::from_str(&args.handoff_id)
-            .map_err(|e| McpError::internal_error(format!("invalid handoff_id: {e}"), None))?;
+        let handoff_id = HandoffId::from_str(args.handoff_id.trim())
+            .map_err(|e| McpError::invalid_params(format!("invalid handoff_id: {e}"), None))?;
         let (ws, proj) = self
             .effective_ids_for_mutation_args_with_actor(
                 args.workspace.as_deref(),
@@ -5816,7 +6318,7 @@ impl AiMemoryServer {
             match args.message_id.as_deref().map(str::trim) {
                 None | Some("") => None,
                 Some(id) => Some(ai_memory_core::MessageId::from_str(id).map_err(|e| {
-                    McpError::internal_error(format!("invalid message_id: {e}"), None)
+                    McpError::invalid_params(format!("invalid message_id: {e}"), None)
                 })?),
             };
         let actor_user = crate::actor::actor_from_parts(&parts)
@@ -5897,7 +6399,7 @@ impl AiMemoryServer {
             match args.message_id.as_deref().map(str::trim) {
                 None | Some("") => None,
                 Some(id) => Some(ai_memory_core::MessageId::from_str(id).map_err(|e| {
-                    McpError::internal_error(format!("invalid message_id: {e}"), None)
+                    McpError::invalid_params(format!("invalid message_id: {e}"), None)
                 })?),
             };
         let admission = self
@@ -5975,7 +6477,12 @@ impl AiMemoryServer {
         description = "Compose a structured snapshot of project activity \
         WITHOUT any LLM call: lifetime counts, 7-day and 30-day activity \
         windows, last-observation timestamp, pending handoff count, \
-        current `_rules/` pages, and recent-page list. Cheap, fast, \
+        current `_rules/` pages, recent-page list, and `recent_sessions`: \
+        the sessions with the newest captured work, newest first. A \
+        session there with `ended: false` that is not `current` was cut \
+        off (a quota limit, a crash) or is still running; when the user \
+        asks to continue, read it with memory_read_session_observations \
+        (order `desc`) before older handoffs or pages. Cheap, fast, \
         deterministic, and READ-ONLY: it never creates handoffs or mutates \
         project state. Use this when you want a programmatic view of \
         project state; use `memory_explore` if you want an LLM-composed \
@@ -6015,9 +6522,25 @@ impl AiMemoryServer {
             )
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let caller = aps_actor.session_id.as_deref().map(SessionId::from_native);
+        let recent_sessions = self
+            .recent_sessions(
+                ws,
+                proj,
+                ai_memory_core::OwnerFilter::for_actor_context(&actor),
+                BRIEFING_RECENT_SESSIONS,
+            )
+            .await?
+            .into_iter()
+            .map(|activity| RecentSession {
+                current: Some(activity.session_id) == caller,
+                activity,
+            })
+            .collect();
         let (workspace, project) = self.scope_names(ws, proj).await;
         ok_json(&BriefingResponse {
             snapshot,
+            recent_sessions,
             scope: AnsweredScope {
                 workspace,
                 project,
@@ -6122,7 +6645,15 @@ impl AiMemoryServer {
             args.reasoning.unwrap_or_default(),
         );
         let provider = llm.llm();
-        let text = match provider.complete(request).await {
+        let text = match provider
+            .complete_with_operation_id(
+                request,
+                ai_memory_llm::LlmOperationId::for_workload(
+                    ai_memory_llm::LlmWorkload::QueryAnswer,
+                ),
+            )
+            .await
+        {
             Ok(resp) => resp.text,
             Err(e) => {
                 // Redacted fields only: the `Display` of a provider failure
@@ -6171,7 +6702,8 @@ impl AiMemoryServer {
         `agent_filenames` for rules-file targets, `managed_skills` for \
         Agent Skill files, and `target_hints` for project/global \
         `.claude/skills`, `.agents/skills`, `.devin/skills`, `.grok/skills`, \
-        `.github/skills`, `.hermes/skills`, `$GROK_HOME/skills` (default `~/.grok/skills`), \
+        `.github/skills`, `.hermes/skills`, Antigravity's `.gemini` skill roots, \
+        `$GROK_HOME/skills` (default `~/.grok/skills`), \
         `$COPILOT_HOME/skills` (default `~/.copilot/skills`), and Devin Windows global roots. \
         Use when the user asks to install or refresh ai-memory routing in this project. \
         Pass `compact: true` to return the compact routing block that delegates \
@@ -6237,7 +6769,8 @@ impl AiMemoryServer {
                     "devin": ".devin/skills",
                     "grok": ".grok/skills",
                     "copilot_cli": ".github/skills",
-                    "hermes": ".hermes/skills"
+                    "hermes": ".hermes/skills",
+                    "antigravity_cli": ".agents/skills"
                 },
                 "global": {
                     "claude_code": "~/.claude/skills",
@@ -6248,7 +6781,11 @@ impl AiMemoryServer {
                     },
                     "grok": "$GROK_HOME/skills (default: ~/.grok/skills)",
                     "copilot_cli": "$COPILOT_HOME/skills (default: ~/.copilot/skills)",
-                    "hermes": "~/.hermes/skills"
+                    "hermes": "~/.hermes/skills",
+                    "antigravity_cli": [
+                        "~/.gemini/config/skills",
+                        "~/.gemini/antigravity-cli/skills"
+                    ]
                 }
             },
             "overwrite_guidance": {
@@ -6262,7 +6799,7 @@ impl AiMemoryServer {
                 "If the target file already uses the compact routing block (or if managed Agent Skills handle detailed routing), call memory_install_self_routing with compact: true so the compact format is preserved.",
                 "If the file doesn't exist, create it with just the markered_block (plus a trailing newline).",
                 "If the file exists but has no ai-memory markers, append the markered_block with one blank line of separation from existing content.",
-                "Install each managed_skills item under the selected skill root from target_hints using its relative_path, for example .claude/skills/<relative_path>, .agents/skills/<relative_path>, .devin/skills/<relative_path>, .grok/skills/<relative_path>, $GROK_HOME/skills/<relative_path> (default ~/.grok/skills), .github/skills/<relative_path> or $COPILOT_HOME/skills/<relative_path> (default ~/.copilot/skills) for GitHub Copilot CLI, or %APPDATA%\\devin\\skills\\<relative_path> on Windows global Devin installs.",
+                "Install each managed_skills item under the selected skill root from target_hints using its relative_path. When a hint is an array, install the item under every listed root; Antigravity's global hint intentionally lists its App/IDE and CLI roots. On Windows, Devin's global root is %APPDATA%\\devin\\skills.",
                 "Existing skill files containing the managed marker <!-- ai-memory-managed: routing-skill --> may be replaced; unmanaged same-name skills must not be overwritten unless the human explicitly forces replacement."
             ]
         });
@@ -7895,6 +8432,10 @@ mod tests {
             server
                 .memory_query(
                     Parameters(QueryArgs {
+                        kind: None,
+                        tier: None,
+                        path_prefix: None,
+                        tag: None,
                         query: "Karpathy".into(),
                         limit: Some(10),
                         project: None,
@@ -7939,6 +8480,10 @@ mod tests {
             server
                 .memory_query(
                     Parameters(QueryArgs {
+                        kind: None,
+                        tier: None,
+                        path_prefix: None,
+                        tag: None,
                         query: "Karpathy".into(),
                         limit: Some(10),
                         project: None,
@@ -8025,6 +8570,7 @@ mod tests {
         "memory_read_page",
         "memory_read_session_observations",
         "memory_delete_page",
+        "memory_restore_page",
         "memory_feedback",
         "memory_lint",
         "memory_forget_sweep",
@@ -8051,6 +8597,7 @@ mod tests {
         "memory_read_page",
         "memory_read_session_observations",
         "memory_delete_page",
+        "memory_restore_page",
         "memory_feedback",
         "memory_lint",
         "memory_forget_sweep",
@@ -9045,7 +9592,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompts_and_tool_schema_document_query_explain_mode() {
+    async fn prompts_and_tool_schema_document_query_options() {
         assert_detailed_prompt_surfaces(|label, prompt| {
             assert!(
                 prompt.contains("explain=true") || prompt.contains("explain: true"),
@@ -9075,6 +9622,16 @@ mod tests {
             .and_then(serde_json::Value::as_object)
             .expect("memory_query schema must expose properties");
         assert!(properties.contains_key("explain"));
+        for field in ["kind", "tier", "path_prefix", "tag"] {
+            assert!(
+                properties.contains_key(field),
+                "memory_query schema must expose {field}: {properties:?}"
+            );
+        }
+        assert!(
+            description.contains("path_prefix") && description.contains("before ranking"),
+            "tool description must explain structured pre-rank filters: {description}"
+        );
     }
 
     #[test]
@@ -9270,6 +9827,24 @@ mod tests {
             "~/.hermes/skills"
         );
         assert_eq!(
+            response["target_hints"]["project"]["antigravity_cli"]
+                .as_str()
+                .unwrap(),
+            ".agents/skills"
+        );
+        assert_eq!(
+            response["target_hints"]["global"]["antigravity_cli"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|root| root.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "~/.gemini/config/skills",
+                "~/.gemini/antigravity-cli/skills"
+            ]
+        );
+        assert_eq!(
             response["target_hints"]["global"]["claude_code"]
                 .as_str()
                 .unwrap(),
@@ -9327,6 +9902,8 @@ mod tests {
             .join("\n");
         assert!(notes.contains(ai_memory_core::routing_skills::MANAGED_MARKER));
         assert!(notes.contains("unmanaged same-name skills"));
+        assert!(notes.contains("When a hint is an array"));
+        assert!(notes.contains("Antigravity"));
         assert!(notes.contains("%APPDATA%\\devin\\skills"));
         assert!(notes.contains("explicitly forces replacement"));
     }
@@ -9822,10 +10399,25 @@ mod tests {
         );
 
         // MEMORY_INSTRUCTIONS is read before an agent ever inspects
-        // `tools/list`, so it carries the same obligation.
+        // `tools/list`, so it carries the same obligation. The ledger pass
+        // removes a new class of file (monthly hook event ledgers), so the
+        // item must name it and its opt-in gate; the stale three-pass count
+        // must not come back either.
         assert!(
             MEMORY_INSTRUCTIONS.contains("hard-deleted even when"),
             "MEMORY_INSTRUCTIONS must warn that expired pages delete despite a pin"
+        );
+        assert!(
+            MEMORY_INSTRUCTIONS.contains("ledger_retention_months"),
+            "MEMORY_INSTRUCTIONS must name the opt-in event-ledger retention pass"
+        );
+        assert!(
+            MEMORY_INSTRUCTIONS.contains("dry_run=true"),
+            "MEMORY_INSTRUCTIONS must say a dry run reports without deleting"
+        );
+        assert!(
+            !MEMORY_INSTRUCTIONS.contains("Three passes"),
+            "the stale three-pass count must not come back in MEMORY_INSTRUCTIONS"
         );
     }
 
@@ -10177,6 +10769,10 @@ mod tests {
         store.writer.upsert_page(v1).await.unwrap();
 
         let args = |as_of: Option<String>, global: Option<bool>| QueryArgs {
+            kind: None,
+            tier: None,
+            path_prefix: None,
+            tag: None,
             query: "postgres".into(),
             limit: Some(5),
             project: Some("scratch".into()),
@@ -10219,6 +10815,10 @@ mod tests {
         let fts_now = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "migrated".into(),
                     limit: Some(5),
                     project: Some("scratch".into()),
@@ -10286,12 +10886,105 @@ mod tests {
         assert!(bad.is_err());
     }
 
+    /// Conflicting scope arguments and a malformed `as_of` are decided from
+    /// the request alone, so they are the caller's mistake: `memory_query`
+    /// answers `invalid params` like the page tools, not an internal error a
+    /// client would read as "the server broke, retry".
+    #[tokio::test]
+    async fn memory_query_answers_bad_arguments_with_invalid_params() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let base = || QueryArgs {
+            query: "karpathy".into(),
+            limit: Some(5),
+            kind: None,
+            tier: None,
+            path_prefix: None,
+            tag: None,
+            project: None,
+            workspace: None,
+            scopes: Vec::new(),
+            global: None,
+            include_expired: None,
+            include_superseded: None,
+            pin_first: None,
+            explain: None,
+            as_of: None,
+            answer: None,
+            reasoning: None,
+        };
+        let scope = |project: &str| MemoryScopeArg {
+            workspace: "default".into(),
+            project: project.into(),
+        };
+
+        let mut global_project = base();
+        global_project.global = Some(true);
+        global_project.project = Some("scratch".into());
+
+        let mut global_workspace = base();
+        global_workspace.global = Some(true);
+        global_workspace.workspace = Some("default".into());
+
+        let mut global_scopes = base();
+        global_scopes.global = Some(true);
+        global_scopes.scopes = vec![scope("scratch")];
+
+        let mut scopes_project = base();
+        scopes_project.scopes = vec![scope("scratch")];
+        scopes_project.project = Some("scratch".into());
+
+        let mut scopes_workspace = base();
+        scopes_workspace.scopes = vec![scope("scratch")];
+        scopes_workspace.workspace = Some("default".into());
+
+        let mut as_of_scopes = base();
+        as_of_scopes.scopes = vec![scope("scratch")];
+        as_of_scopes.as_of = Some("2026-06-01T00:00:00Z".into());
+
+        let mut as_of_global = base();
+        as_of_global.global = Some(true);
+        as_of_global.as_of = Some("2026-06-01T00:00:00Z".into());
+
+        let mut malformed_as_of = base();
+        malformed_as_of.as_of = Some("not-a-time".into());
+
+        for (what, args) in [
+            ("global + project", global_project),
+            ("global + workspace", global_workspace),
+            ("global + scopes", global_scopes),
+            ("scopes + project", scopes_project),
+            ("scopes + workspace", scopes_workspace),
+            ("as_of + scopes", as_of_scopes),
+            ("as_of + global", as_of_global),
+            ("malformed as_of", malformed_as_of),
+        ] {
+            let err = server
+                .memory_query(Parameters(args), OptionalParts(test_parts_default()))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{what}: {err:?}"
+            );
+        }
+
+        server
+            .memory_query(Parameters(base()), OptionalParts(test_parts_default()))
+            .await
+            .expect("a well-formed query is not rejected");
+    }
+
     #[tokio::test]
     async fn memory_query_returns_hits_via_tool_method() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "karpathy".into(),
                     limit: Some(5),
                     project: None,
@@ -10322,6 +11015,10 @@ mod tests {
         let explained = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "karpathy".into(),
                     limit: Some(5),
                     project: None,
@@ -10410,6 +11107,10 @@ mod tests {
                 server
                     .memory_query(
                         Parameters(QueryArgs {
+                            kind: None,
+                            tier: None,
+                            path_prefix: None,
+                            tag: None,
                             query: "karpathy".into(),
                             limit: Some(5),
                             project: None,
@@ -10510,6 +11211,10 @@ mod tests {
             let result = server
                 .memory_query(
                     Parameters(QueryArgs {
+                        kind: None,
+                        tier: None,
+                        path_prefix: None,
+                        tag: None,
                         query: q.into(),
                         limit: Some(10),
                         project: None,
@@ -10601,6 +11306,10 @@ mod tests {
             .unwrap();
 
         let query = |workspace: Option<&str>, project: Option<&str>| QueryArgs {
+            kind: None,
+            tier: None,
+            path_prefix: None,
+            tag: None,
             query: "karpathy".into(),
             limit: Some(5),
             project: project.map(str::to_string),
@@ -10757,6 +11466,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "sharedterm".into(),
                     limit: Some(10),
                     project: Some("scratch".into()),
@@ -10797,6 +11510,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "karpathy".into(),
                     limit: Some(5),
                     project: None,
@@ -10935,6 +11652,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "quokka".into(),
                     limit: Some(5),
                     project: None,
@@ -10966,6 +11687,355 @@ mod tests {
             "expected raw fallback; got {text}"
         );
         assert!(text.contains("quokka"), "expected raw snippet; got {text}");
+
+        let mut filtered_args = query_in("scratch", "quokka");
+        filtered_args.tag = Some("animals".into());
+        let filtered = server
+            .memory_query(
+                Parameters(filtered_args),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let filtered = tool_json(&filtered);
+        assert!(filtered["hits"].as_array().unwrap().is_empty());
+        assert!(
+            filtered.get("raw_hits").is_none(),
+            "observations do not carry page tags and must not bypass a filter: {filtered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_query_filters_apply_before_every_result_source() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        for (path, kind, tier, tags, pinned) in [
+            (
+                "notes/percent%_literal.md",
+                "decision",
+                Tier::Procedural,
+                serde_json::json!(["Storage", "release"]),
+                true,
+            ),
+            (
+                "notes/other.md",
+                "note",
+                Tier::Semantic,
+                serde_json::json!(["Storage"]),
+                true,
+            ),
+            (
+                "other/decision.md",
+                "decision",
+                Tier::Procedural,
+                serde_json::json!(["Storage"]),
+                true,
+            ),
+            (
+                "notes/scalar-tag.md",
+                "decision",
+                Tier::Procedural,
+                serde_json::json!("Storage"),
+                false,
+            ),
+        ] {
+            store
+                .writer
+                .upsert_page(NewPage {
+                    workspace_id: ws,
+                    project_id: proj,
+                    path: PagePath::new(path).unwrap(),
+                    title: path.into(),
+                    body: "filterneedle shared text".into(),
+                    tier,
+                    frontmatter_json: serde_json::json!({"kind": kind, "tags": tags}),
+                    pinned,
+                    links: Vec::new(),
+                    author_id: None,
+                    expires_at: None,
+                    entities: vec!["filterneedle".into()],
+                    evidence: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let mut combined = query_in("scratch", "filterneedle");
+        combined.kind = Some("DECISION".into());
+        combined.tier = Some("PROCEDURAL".into());
+        combined.path_prefix = Some("notes/percent%_".into());
+        combined.tag = Some("storage".into());
+        let combined = server
+            .memory_query(Parameters(combined), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+        let combined = tool_json(&combined);
+        assert_eq!(
+            combined["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hit| hit["path"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["notes/percent%_literal.md"],
+            "all filters must combine before ranking: {combined}"
+        );
+
+        let mut differently_cased_path = query_in("scratch", "filterneedle");
+        differently_cased_path.path_prefix = Some("NOTES/".into());
+        let differently_cased_path = server
+            .memory_query(
+                Parameters(differently_cased_path),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tool_json(&differently_cased_path)["hits"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "literal path prefixes are case-sensitive"
+        );
+
+        let mut tag_only = query_in("scratch", "filterneedle");
+        tag_only.tag = Some("STORAGE".into());
+        let tag_only = server
+            .memory_query(Parameters(tag_only), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+        let tag_paths: std::collections::HashSet<String> = tool_json(&tag_only)["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["path"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(!tag_paths.contains("notes/scalar-tag.md"));
+        assert!(tag_paths.contains("notes/other.md"));
+
+        let mut pinned = query_in("scratch", "doesnotexist");
+        pinned.pin_first = Some(true);
+        pinned.path_prefix = Some("notes/percent%_".into());
+        let pinned = server
+            .memory_query(Parameters(pinned), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+        assert_eq!(
+            tool_json(&pinned)["hits"][0]["path"],
+            "notes/percent%_literal.md",
+            "unfiltered pinned pages must not bypass path_prefix"
+        );
+
+        let mut global = query_in("scratch", "filterneedle");
+        global.workspace = None;
+        global.project = None;
+        global.global = Some(true);
+        global.path_prefix = Some("other/".into());
+        let global = server
+            .memory_query(Parameters(global), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+        assert_eq!(
+            tool_json(&global)["global_hits"][0]["path"],
+            "other/decision.md"
+        );
+
+        let sibling = store
+            .writer
+            .get_or_create_project(ws, "filter-sibling", None)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: sibling,
+                path: PagePath::new("other/sibling.md").unwrap(),
+                title: "Sibling decision".into(),
+                body: "filterneedle shared text".into(),
+                tier: Tier::Procedural,
+                frontmatter_json: serde_json::json!({"kind": "decision", "tags": ["Storage"]}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let mut scoped = query_in("scratch", "filterneedle");
+        scoped.workspace = None;
+        scoped.project = None;
+        scoped.scopes = vec![
+            MemoryScopeArg {
+                workspace: "default".into(),
+                project: "scratch".into(),
+            },
+            MemoryScopeArg {
+                workspace: "default".into(),
+                project: "filter-sibling".into(),
+            },
+        ];
+        scoped.path_prefix = Some("other/".into());
+        scoped.tag = Some("storage".into());
+        let scoped = server
+            .memory_query(Parameters(scoped), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+        let scoped_paths: std::collections::HashSet<String> = tool_json(&scoped)["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["path"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            scoped_paths,
+            [
+                "other/decision.md".to_owned(),
+                "other/sibling.md".to_owned()
+            ]
+            .into_iter()
+            .collect(),
+            "every explicit scope must apply the structured filter"
+        );
+
+        let mut historical = query_in("scratch", "filterneedle");
+        historical.as_of = Some(jiff::Timestamp::now().to_string());
+        historical.path_prefix = Some("other/".into());
+        historical.tag = Some("storage".into());
+        let historical = server
+            .memory_query(Parameters(historical), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+        assert_eq!(
+            tool_json(&historical)["hits"][0]["path"],
+            "other/decision.md"
+        );
+
+        let history_path = PagePath::new("history/choice.md").unwrap();
+        let mut history_page = NewPage {
+            workspace_id: ws,
+            project_id: proj,
+            path: history_path.clone(),
+            title: "Historical decision".into(),
+            body: "filterhistory shared text".into(),
+            tier: Tier::Procedural,
+            frontmatter_json: serde_json::json!({"kind": "decision", "tags": ["old"]}),
+            pinned: false,
+            links: Vec::new(),
+            author_id: None,
+            expires_at: None,
+            entities: vec!["filterhistory".into()],
+            evidence: Vec::new(),
+        };
+        store
+            .writer
+            .upsert_page(history_page.clone())
+            .await
+            .unwrap();
+        history_page.title = "Current note".into();
+        history_page.tier = Tier::Semantic;
+        history_page.frontmatter_json = serde_json::json!({"kind": "note", "tags": ["new"]});
+        store.writer.upsert_page(history_page).await.unwrap();
+
+        let mut superseded = query_in("scratch", "filterhistory");
+        superseded.include_superseded = Some(true);
+        superseded.kind = Some("decision".into());
+        superseded.tag = Some("old".into());
+        let superseded = server
+            .memory_query(Parameters(superseded), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+        let superseded = tool_json(&superseded);
+        assert_eq!(superseded["hits"][0]["path"], history_path.as_str());
+        assert_eq!(superseded["hits"][0]["superseded"], true);
+
+        let global_scope = ai_memory_store::create_global_scope(&store.writer)
+            .await
+            .unwrap();
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: global_scope.workspace_id,
+                project_id: global_scope.project_id,
+                path: PagePath::new("profile/filtered.md").unwrap(),
+                title: "Filtered profile".into(),
+                body: "filterprofile shared text".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({"kind": "preference", "tags": ["shell"]}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: None,
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let mut profile_union = query_in("scratch", "filterprofile");
+        profile_union.path_prefix = Some("profile/".into());
+        profile_union.tag = Some("shell".into());
+        let profile_union = server
+            .memory_query(
+                Parameters(profile_union),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tool_json(&profile_union)["global_scope_hits"][0]["path"],
+            "profile/filtered.md"
+        );
+        let mut excluded_profile = query_in("scratch", "filterprofile");
+        excluded_profile.path_prefix = Some("notes/".into());
+        let excluded_profile = server
+            .memory_query(
+                Parameters(excluded_profile),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            tool_json(&excluded_profile)
+                .get("global_scope_hits")
+                .is_none(),
+            "the reserved-global/profile union must not bypass filters"
+        );
+
+        let mut traversal = query_in("scratch", "filterneedle");
+        traversal.path_prefix = Some("../".into());
+        let traversal = server
+            .memory_query(Parameters(traversal), OptionalParts(test_parts_default()))
+            .await
+            .unwrap();
+        assert!(tool_json(&traversal)["hits"].as_array().unwrap().is_empty());
+
+        let mut invalid = query_in("scratch", "filterneedle");
+        invalid.tier = Some("archive".into());
+        let error = server
+            .memory_query(Parameters(invalid), OptionalParts(test_parts_default()))
+            .await
+            .expect_err("unknown tiers must be rejected");
+        assert!(error.to_string().contains("tier must be"), "{error}");
+
+        let mut control = query_in("scratch", "filterneedle");
+        control.path_prefix = Some("notes/\nprivate/".into());
+        let error = server
+            .memory_query(Parameters(control), OptionalParts(test_parts_default()))
+            .await
+            .expect_err("control characters must be rejected");
+        assert!(error.to_string().contains("control characters"), "{error}");
+
+        let mut long_tag = query_in("scratch", "filterneedle");
+        long_tag.tag = Some("é".repeat(MAX_QUERY_TAG_LEN + 1));
+        let error = server
+            .memory_query(Parameters(long_tag), OptionalParts(test_parts_default()))
+            .await
+            .expect_err("overlong Unicode tags must be rejected by character count");
+        assert!(
+            error.to_string().contains("at most 128 characters"),
+            "{error}"
+        );
     }
 
     /// `memory_query` hands the store the caller's session-timeline owner
@@ -11058,6 +12128,10 @@ mod tests {
                 let result = server
                     .memory_query(
                         Parameters(QueryArgs {
+                            kind: None,
+                            tier: None,
+                            path_prefix: None,
+                            tag: None,
                             query: term,
                             limit: Some(5),
                             project: Some("scratch".into()),
@@ -11165,6 +12239,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "quokka".into(),
                     limit: Some(5),
                     project: None,
@@ -11258,6 +12336,10 @@ mod tests {
             server
                 .memory_query(
                     Parameters(QueryArgs {
+                        kind: None,
+                        tier: None,
+                        path_prefix: None,
+                        tag: None,
                         query: "rank_token".into(),
                         limit: Some(3),
                         project: None,
@@ -11328,6 +12410,10 @@ mod tests {
             server
                 .memory_query(
                     Parameters(QueryArgs {
+                        kind: None,
+                        tier: None,
+                        path_prefix: None,
+                        tag: None,
                         query: "dedupe_token".into(),
                         limit: Some(10),
                         project: None,
@@ -11380,6 +12466,10 @@ mod tests {
         let err = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "missing_scope_token".into(),
                     limit: Some(10),
                     project: None,
@@ -11453,6 +12543,10 @@ mod tests {
             server
                 .memory_query(
                     Parameters(QueryArgs {
+                        kind: None,
+                        tier: None,
+                        path_prefix: None,
+                        tag: None,
                         query: "mixed_scope_token".into(),
                         limit: Some(10),
                         project: None,
@@ -11532,6 +12626,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "workspace_specific_token".into(),
                     limit: Some(5),
                     project: Some("unit-testing".into()),
@@ -12466,6 +13564,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_read_page_marks_an_expired_page() {
+        let (tmp, store, server, ws, proj) = setup_server().await;
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        for (path, expires_at) in [
+            ("notes/expired.md", "2000-01-01"),
+            ("notes/future.md", "2999-01-01"),
+        ] {
+            wiki.write_page(WritePageRequest {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new(path).unwrap(),
+                frontmatter: serde_json::json!({"title": "Dated", "expires_at": expires_at}),
+                body: "dated body".to_string(),
+                tier: Tier::Semantic,
+                pinned: false,
+                title: Some("Dated".into()),
+                admission_ctx: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+        }
+        // The DB-fallback branch annotates too: an expired row with no
+        // markdown file behind it.
+        let a_minute_ago = jiff::Timestamp::now().as_second() - 60;
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("notes/db-only-expired.md").unwrap(),
+                title: "DB Only Expired".into(),
+                body: "fallback body".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({"title": "DB Only Expired"}),
+                pinned: false,
+                links: Vec::new(),
+                author_id: None,
+                expires_at: Some(jiff::Timestamp::from_second(a_minute_ago).unwrap()),
+                entities: Vec::new(),
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let server = server.with_wiki(wiki);
+        for (path, expired) in [
+            ("notes/expired.md", true),
+            ("notes/future.md", false),
+            ("notes/db-only-expired.md", true),
+        ] {
+            let result = server
+                .memory_read_page(
+                    Parameters(ReadPageArgs {
+                        query: None,
+                        path: Some(path.into()),
+                        project: None,
+                        workspace: None,
+                        include_related: false,
+                        related_depth: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap();
+            let text = result
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.clone())
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            // The page is still returned, and the flag appears only once the
+            // TTL has passed: a live page's response keeps its exact shape.
+            assert_eq!(json["path"], path, "{text}");
+            assert_eq!(
+                json.get("expired").and_then(serde_json::Value::as_bool),
+                expired.then_some(true),
+                "{path}: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn memory_read_page_missing_error_names_the_scope() {
         let (tmp, store, server, _ws, _proj) = setup_server().await;
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
@@ -12762,14 +13946,274 @@ mod tests {
             "error must name the resolved scope; got {msg}"
         );
 
+        // A non-UUID id is a native id: it maps like the hooks map it, and an
+        // unknown one reads as not found in the resolved scope.
         let mut args = session_observations_args(Some(session_id));
         args.session_id = Some("not-a-uuid".into());
         let err = server
             .memory_read_session_observations(Parameters(args), test_optional_parts())
             .await
-            .expect_err("a malformed session id must be rejected");
+            .expect_err("an unknown native session id must read as not found");
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
-        assert_eq!(err.message, "invalid session id: not-a-uuid");
+        assert_eq!(
+            err.message,
+            "session not-a-uuid not found in default/scratch"
+        );
+    }
+
+    /// One session with an explicit id and agent whose rows land `step_us`
+    /// apart from `start_us`, so tests can order sessions by their work.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_session_at(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        session_id: SessionId,
+        agent_kind: AgentKind,
+        start_us: i64,
+        kinds: &[ObservationKind],
+        completed: bool,
+    ) {
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: Some(start_us),
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        for (step, kind) in kinds.iter().enumerate() {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: Some(start_us + 1_000 * (step as i64 + 1)),
+                        session_id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: *kind,
+                        extension: None,
+                        source_event: None,
+                        title: format!("{kind:?}"),
+                        body: "router ipv6".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+        if completed {
+            store.writer.end_session(session_id, None).await.unwrap();
+        }
+    }
+
+    fn now_us() -> i64 {
+        jiff::Timestamp::now().as_microsecond()
+    }
+
+    /// The harness's own native id (an OpenCode `ses_…`) reads the session
+    /// the hooks stored under its v5 mapping.
+    #[tokio::test]
+    async fn memory_read_session_observations_accepts_a_native_session_id() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let native = "ses_ff9168f0dffexGd81eJNiCuKBB";
+        seed_session_at(
+            &store,
+            ws,
+            proj,
+            SessionId::from_native(native),
+            AgentKind::OpenCode,
+            now_us() - 60_000_000,
+            &[ObservationKind::UserPrompt, ObservationKind::PostToolUse],
+            false,
+        )
+        .await;
+        let mut args = session_observations_args(None);
+        args.session_id = Some(native.into());
+        args.order = Some("desc".into());
+        let page = call_tool_json(
+            server
+                .memory_read_session_observations(Parameters(args), test_optional_parts())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(page["total"], 2);
+        assert_eq!(
+            page["session"]["session_id"],
+            SessionId::from_native(native).to_string()
+        );
+        assert_eq!(page["observations"][0]["kind"], "post-tool-use");
+    }
+
+    /// `recent_sessions` orders by newest work and flags the caller's own
+    /// session, so a harness that was cut off without ending is visible to
+    /// the next one even though an older session ended more recently.
+    #[tokio::test]
+    async fn memory_briefing_lists_a_cut_off_session_before_older_work() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let start = now_us() - 3_600_000_000;
+        let clean = SessionId::new();
+        seed_session_at(
+            &store,
+            ws,
+            proj,
+            clean,
+            AgentKind::ClaudeCode,
+            start,
+            &[ObservationKind::UserPrompt],
+            true,
+        )
+        .await;
+        let cut_off = SessionId::from_native("ses_cut_off");
+        seed_session_at(
+            &store,
+            ws,
+            proj,
+            cut_off,
+            AgentKind::OpenCode,
+            start + 60_000_000,
+            &[ObservationKind::UserPrompt, ObservationKind::PostToolUse],
+            false,
+        )
+        .await;
+        let caller = "claude-resumed";
+        seed_session_at(
+            &store,
+            ws,
+            proj,
+            SessionId::from_native(caller),
+            AgentKind::ClaudeCode,
+            start + 30_000_000,
+            &[ObservationKind::UserPrompt],
+            false,
+        )
+        .await;
+        let mut parts = test_parts_default();
+        parts
+            .headers
+            .insert("x-memory-actor-session-id", caller.parse().unwrap());
+        let briefing = call_tool_json(
+            server
+                .memory_briefing(
+                    Parameters(BriefingArgs {
+                        recent_pages_limit: None,
+                        project: None,
+                        workspace: None,
+                        settled_first: None,
+                    }),
+                    OptionalParts(parts),
+                )
+                .await
+                .unwrap(),
+        );
+        let sessions = briefing["recent_sessions"].as_array().unwrap();
+        let listed: Vec<(&str, bool, bool)> = sessions
+            .iter()
+            .map(|entry| {
+                (
+                    entry["agent_kind"].as_str().unwrap(),
+                    entry["ended"].as_bool().unwrap(),
+                    entry["current"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("open-code", false, false),
+                ("claude-code", false, true),
+                ("claude-code", true, false),
+            ],
+            "{briefing}"
+        );
+        assert_eq!(sessions[0]["session_id"], cut_off.to_string());
+    }
+
+    /// `memory_handoff_list` names a cut-off session only while it is newer
+    /// than every open handoff; a newer handoff already covers it.
+    #[tokio::test]
+    async fn memory_handoff_list_names_a_cut_off_session_newer_than_every_handoff() {
+        async fn baton(store: &Store, ws: WorkspaceId, proj: ProjectId) {
+            store
+                .writer
+                .insert_handoff(NewHandoff {
+                    workspace_id: ws,
+                    project_id: proj,
+                    from_session_id: None,
+                    from_agent: AgentKind::ClaudeCode,
+                    to_agent: None,
+                    cwd: None,
+                    summary: "a baton".into(),
+                    open_questions: vec![],
+                    next_steps: vec![],
+                    files_touched: vec![],
+                    owner_user: None,
+                })
+                .await
+                .unwrap();
+        }
+        async fn list(server: &AiMemoryServer) -> serde_json::Value {
+            call_tool_json(
+                server
+                    .memory_handoff_list(
+                        Parameters(HandoffListArgs {
+                            any_owner: None,
+                            limit: None,
+                            project: None,
+                            workspace: None,
+                        }),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .unwrap(),
+            )
+        }
+        let cut_off = SessionId::from_native("ses_cut_off");
+
+        // The baton first, then work that never ended: the baton is stale.
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        baton(&store, ws, proj).await;
+        seed_session_at(
+            &store,
+            ws,
+            proj,
+            cut_off,
+            AgentKind::OpenCode,
+            now_us(),
+            &[ObservationKind::UserPrompt],
+            false,
+        )
+        .await;
+        let listed = list(&server).await;
+        assert_eq!(listed["handoffs"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            listed["newer_unended_session"]["session_id"],
+            cut_off.to_string(),
+            "{listed}"
+        );
+
+        // Work first, then a baton: the baton covers it.
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        seed_session_at(
+            &store,
+            ws,
+            proj,
+            cut_off,
+            AgentKind::OpenCode,
+            now_us() - 60_000_000,
+            &[ObservationKind::UserPrompt],
+            false,
+        )
+        .await;
+        baton(&store, ws, proj).await;
+        let listed = list(&server).await;
+        assert!(listed.get("newer_unended_session").is_none(), "{listed}");
     }
 
     #[tokio::test]
@@ -12802,54 +14246,271 @@ mod tests {
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
     }
 
-    #[tokio::test]
-    async fn memory_read_session_observations_defaults_to_latest_completed_session() {
-        let (_tmp, store, server, ws, proj) = setup_server().await;
-        let err = server
+    /// One session with a cwd and an owner, and one prompt `start_us`
+    /// into it, for the default-session tests.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_owned_session(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        session_id: SessionId,
+        cwd: &str,
+        actor_user: Option<&str>,
+        start_us: i64,
+        completed: bool,
+    ) {
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: Some(start_us),
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Codex,
+                cwd: Some(cwd.into()),
+                actor_user: actor_user
+                    .map(|user| ai_memory_core::IdentityKey::User(user.into()).storage_key()),
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    occurred_at: Some(start_us + 1_000),
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "work".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        if completed {
+            store.writer.end_session(session_id, None).await.unwrap();
+        }
+    }
+
+    async fn default_session_read(
+        server: &AiMemoryServer,
+        parts: axum::http::request::Parts,
+    ) -> Result<serde_json::Value, McpError> {
+        server
             .memory_read_session_observations(
                 Parameters(session_observations_args(None)),
-                test_optional_parts(),
+                OptionalParts(parts),
             )
             .await
-            .expect_err("an empty project has no completed session");
+            .map(call_tool_json)
+    }
+
+    fn parts_with_caller(user: Option<&str>, session: &str) -> axum::http::request::Parts {
+        let mut parts = test_parts_default();
+        parts
+            .headers
+            .insert("x-memory-actor-session-id", session.parse().unwrap());
+        if let Some(user) = user {
+            parts.extensions.insert(AuthLevel::User);
+            parts.extensions.insert(ActorContext {
+                user: Some(user.into()),
+                ..ActorContext::default()
+            });
+        }
+        parts
+    }
+
+    /// Omitting `session_id` reads the newest work, ended or not (#1512): a
+    /// harness cut off without ending is exactly what the next one takes
+    /// over. With the caller's session known, its own cwd comes first and
+    /// its own session is never the answer.
+    #[tokio::test]
+    async fn memory_read_session_observations_defaults_to_newest_other_session() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let err = default_session_read(&server, test_parts_default())
+            .await
+            .expect_err("an empty project has no session to default to");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert!(
             err.to_string()
-                .contains("no completed session in default/scratch"),
+                .contains("no other session in default/scratch"),
             "got {err}"
         );
 
-        let completed = seed_session_observations(
+        // Nothing worked in the window: the latest completed session.
+        let old = SessionId::new();
+        seed_owned_session(
             &store,
             ws,
             proj,
+            old,
+            "/w/a",
+            None,
+            now_us() - 40 * 86_400_000_000,
             true,
-            &[(ObservationKind::UserPrompt, "done", "completed work")],
         )
         .await;
-        let _open = seed_session_observations(
+        let page = default_session_read(&server, test_parts_default())
+            .await
+            .unwrap();
+        assert_eq!(page["session"]["session_id"], old.to_string());
+
+        let start = now_us() - 3_600_000_000;
+        let same_cwd = SessionId::new();
+        seed_owned_session(&store, ws, proj, same_cwd, "/w/a", None, start, false).await;
+        let elsewhere = SessionId::new();
+        seed_owned_session(
             &store,
             ws,
             proj,
+            elsewhere,
+            "/w/b",
+            None,
+            start + 60_000_000,
+            true,
+        )
+        .await;
+        let caller = "codex-taking-over";
+        seed_owned_session(
+            &store,
+            ws,
+            proj,
+            SessionId::from_native(caller),
+            "/w/a",
+            None,
+            start + 120_000_000,
             false,
-            &[(ObservationKind::UserPrompt, "live", "still running")],
         )
         .await;
 
-        let page = call_tool_json(
-            server
-                .memory_read_session_observations(
-                    Parameters(session_observations_args(None)),
-                    test_optional_parts(),
-                )
-                .await
-                .unwrap(),
-        );
+        // No caller session: the newest work in the scope.
+        let page = default_session_read(&server, test_parts_default())
+            .await
+            .unwrap();
         assert_eq!(
             page["session"]["session_id"],
-            completed.to_string(),
-            "the open session must be skipped"
+            SessionId::from_native(caller).to_string()
         );
-        assert_eq!(page["observations"][0]["title"], "done");
+
+        // The caller in /w/a: the open session it takes over, not the newer
+        // one another checkout ended, and never itself.
+        let page = default_session_read(&server, parts_with_caller(None, caller))
+            .await
+            .unwrap();
+        assert_eq!(
+            page["session"]["session_id"],
+            same_cwd.to_string(),
+            "{page}"
+        );
+        assert_eq!(page["session"]["cwd"], "/w/a");
+        assert!(page["session"]["ended_at"].is_null(), "{page}");
+        assert_eq!(page["observations"][0]["title"], "prompt");
+
+        // A caller whose cwd has no other session: the newest other one.
+        let loner = "claude-elsewhere";
+        seed_owned_session(
+            &store,
+            ws,
+            proj,
+            SessionId::from_native(loner),
+            "/w/c",
+            None,
+            start + 180_000_000,
+            false,
+        )
+        .await;
+        let page = default_session_read(&server, parts_with_caller(None, loner))
+            .await
+            .unwrap();
+        assert_eq!(
+            page["session"]["session_id"],
+            SessionId::from_native(caller).to_string()
+        );
+    }
+
+    /// The default never reaches another operator's session or another
+    /// project's, however new and whatever cwd it shares with the caller
+    /// (#1512): the owner filter and the resolved scope bound the scan.
+    #[tokio::test]
+    async fn memory_read_session_observations_default_never_crosses_owner_or_project() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let other_project = store
+            .writer
+            .get_or_create_project(ws, "other", None)
+            .await
+            .unwrap();
+        let start = now_us() - 3_600_000_000;
+        let caller = "alice-taking-over";
+        seed_owned_session(
+            &store,
+            ws,
+            proj,
+            SessionId::from_native(caller),
+            "/w/a",
+            Some("alice"),
+            start + 300_000_000,
+            false,
+        )
+        .await;
+        let bobs = SessionId::new();
+        seed_owned_session(
+            &store,
+            ws,
+            proj,
+            bobs,
+            "/w/a",
+            Some("bob"),
+            start + 200_000_000,
+            false,
+        )
+        .await;
+        let foreign = SessionId::new();
+        seed_owned_session(
+            &store,
+            ws,
+            other_project,
+            foreign,
+            "/w/a",
+            Some("alice"),
+            start + 250_000_000,
+            false,
+        )
+        .await;
+
+        let err = default_session_read(&server, parts_with_caller(Some("alice"), caller))
+            .await
+            .expect_err("only Bob's and another project's sessions exist besides Alice's own");
+        assert_eq!(
+            err.message,
+            "no other session in default/scratch; pass session_id to read one"
+        );
+
+        // Control: Alice's own older session is the default.
+        let alices = SessionId::new();
+        seed_owned_session(
+            &store,
+            ws,
+            proj,
+            alices,
+            "/w/a",
+            Some("alice"),
+            start,
+            false,
+        )
+        .await;
+        let page = default_session_read(&server, parts_with_caller(Some("alice"), caller))
+            .await
+            .unwrap();
+        assert_eq!(page["session"]["session_id"], alices.to_string(), "{page}");
+        let bob = default_session_read(&server, parts_with_caller(Some("bob"), "bob-new"))
+            .await
+            .unwrap();
+        assert_eq!(bob["session"]["session_id"], bobs.to_string(), "{bob}");
     }
 
     #[tokio::test]
@@ -12965,6 +14626,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "multi_scope_token".into(),
                     limit: Some(10),
                     project: None,
@@ -13087,6 +14752,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "global_token".into(),
                     limit: Some(10),
                     project: None,
@@ -13138,6 +14807,10 @@ mod tests {
         let include_expired = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "global_token".into(),
                     limit: Some(10),
                     project: None,
@@ -13222,6 +14895,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "recall_token".into(),
                     limit: Some(10),
                     project: None,
@@ -13258,6 +14935,10 @@ mod tests {
         let scoped = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "recall_token".into(),
                     limit: Some(10),
                     project: Some("runbooks".into()),
@@ -13290,6 +14971,53 @@ mod tests {
             !scoped_text.contains("cluster.md"),
             "explicit scope must NOT broaden to infra: {scoped_text}"
         );
+
+        // `as_of` wins over default_global too: the time-travel lookup reads
+        // the current project (infra) instead of being broadened to a global
+        // search that would drop the instant and answer with today's rows.
+        let historical = server
+            .memory_query(
+                Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
+                    query: "recall_token".into(),
+                    limit: Some(10),
+                    project: None,
+                    scopes: Vec::new(),
+                    workspace: None,
+                    global: None,
+                    include_expired: None,
+                    include_superseded: None,
+                    pin_first: None,
+                    explain: None,
+                    as_of: Some(jiff::Timestamp::now().to_string()),
+                    answer: None,
+                    reasoning: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let historical_text = historical
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(
+            !historical_text.contains("global_hits"),
+            "as_of must not be broadened to global: {historical_text}"
+        );
+        assert!(
+            historical_text.contains("cluster.md"),
+            "as_of reads the current project: {historical_text}"
+        );
+        assert!(
+            !historical_text.contains("deploy.md"),
+            "as_of stays in the current project: {historical_text}"
+        );
     }
 
     #[tokio::test]
@@ -13298,6 +15026,10 @@ mod tests {
         let err = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "x".into(),
                     limit: Some(5),
                     project: Some("product".into()),
@@ -13673,6 +15405,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "karpathy".into(),
                     limit: Some(5),
                     project: None,
@@ -14808,6 +16544,91 @@ mod tests {
         }
     }
 
+    /// A malformed path, tier or scope is the caller's mistake, so the page
+    /// tools answer `invalid params` like their siblings, not an internal
+    /// error a client would read as "the server broke, retry".
+    #[tokio::test]
+    async fn page_tools_answer_bad_path_tier_and_scope_with_invalid_params() {
+        let (tmp, store, server, _ws, _pj) = setup_server().await;
+        let server = server.with_wiki(Wiki::new(tmp.path(), store.writer.clone()).unwrap());
+        let write = |path: &str, tier: Option<&str>, scope: Option<&str>, project: Option<&str>| {
+            WritePageArgs {
+                metadata: Default::default(),
+                path: path.into(),
+                body: "# Page\n".into(),
+                title: None,
+                tier: tier.map(Into::into),
+                tags: vec![],
+                pinned: false,
+                project: project.map(Into::into),
+                workspace: None,
+                scope: scope.map(Into::into),
+                expires_at: None,
+                session_id: None,
+                create_only: false,
+                expected_page_id: None,
+            }
+        };
+        for args in [
+            write("notes/a|b.md", None, None, None),
+            write("../x.md", None, None, None),
+            write("notes/ok.md", Some("bogus"), None, None),
+            write("notes/ok.md", None, Some("global"), Some("x")),
+            write("notes/ok.md", None, Some("profile"), Some("x")),
+            write("notes/ok.md", None, Some("elsewhere"), None),
+        ] {
+            let what = format!("{:?} {:?} {:?}", args.path, args.tier, args.scope);
+            let err = server
+                .memory_write_page(Parameters(args), OptionalParts(test_parts_default()))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{what}: {err:?}"
+            );
+        }
+
+        let err = server
+            .memory_read_page(
+                Parameters(ReadPageArgs {
+                    query: None,
+                    path: Some("../x.md".into()),
+                    project: None,
+                    workspace: None,
+                    include_related: false,
+                    related_depth: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "read: {err:?}"
+        );
+
+        let err = server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    scope: None,
+                    path: "../x.md".into(),
+                    project: None,
+                    workspace: None,
+                    expected_page_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "delete: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn memory_write_page_rejects_workspace_without_project() {
         let tmp = TempDir::new().unwrap();
@@ -15504,6 +17325,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "globalverify".into(),
                     limit: Some(5),
                     project: Some("acme-app".into()),
@@ -15565,6 +17390,10 @@ mod tests {
 
     fn query_in(project: &str, query: &str) -> QueryArgs {
         QueryArgs {
+            kind: None,
+            tier: None,
+            path_prefix: None,
+            tag: None,
             query: query.into(),
             limit: Some(10),
             project: Some(project.into()),
@@ -16438,6 +18267,10 @@ mod tests {
                 let result = server
                     .memory_query(
                         Parameters(QueryArgs {
+                            kind: None,
+                            tier: None,
+                            path_prefix: None,
+                            tag: None,
                             reasoning: None,
                             answer: None,
                             include_superseded: None,
@@ -16627,6 +18460,10 @@ mod tests {
                     server
                         .memory_query(
                             Parameters(QueryArgs {
+                                kind: None,
+                                tier: None,
+                                path_prefix: None,
+                                tag: None,
                                 reasoning: None,
                                 answer: None,
                                 include_superseded: None,
@@ -17111,6 +18948,285 @@ mod tests {
             !recent_text.contains("notes/temp.md"),
             "deleted page must not linger in the index; got {recent_text}"
         );
+    }
+
+    fn result_json(result: &CallToolResult) -> serde_json::Value {
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn restore_args(path: &str, rev: Option<&str>, project: Option<&str>) -> RestorePageArgs {
+        RestorePageArgs {
+            path: path.into(),
+            rev: rev.map(str::to_owned),
+            limit: None,
+            project: project.map(str::to_owned),
+            workspace: project.map(|_| "default".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_restore_page_lists_checkpoints_and_brings_back_a_deleted_page() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+
+        server
+            .memory_write_page(
+                Parameters(WritePageArgs {
+                    metadata: Default::default(),
+                    path: "notes/retries.md".into(),
+                    body: "# Retries\n\nKeep the same event id.".into(),
+                    title: None,
+                    tier: Some("semantic".into()),
+                    tags: vec!["delivery".into()],
+                    pinned: false,
+                    project: None,
+                    workspace: None,
+                    scope: None,
+                    expires_at: None,
+                    session_id: None,
+                    expected_page_id: None,
+                    create_only: false,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    scope: None,
+                    path: "notes/retries.md".into(),
+                    project: None,
+                    workspace: None,
+                    expected_page_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+
+        let listed = result_json(
+            &server
+                .memory_restore_page(
+                    Parameters(restore_args("notes/retries.md", None, None)),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        let revs: Vec<String> = listed["checkpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["rev"].as_str().map(str::to_owned))
+            .collect();
+        assert!(
+            revs.len() >= 2,
+            "the write and the delete both changed the page: {listed}"
+        );
+        let pre = revs[1].clone();
+
+        let restored = result_json(
+            &server
+                .memory_restore_page(
+                    Parameters(restore_args("notes/retries.md", Some(&pre), None)),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(restored["restored_from"], pre.as_str());
+
+        let read = result_json(
+            &server
+                .memory_read_page(
+                    Parameters(ReadPageArgs {
+                        query: None,
+                        path: Some("notes/retries.md".into()),
+                        project: None,
+                        workspace: None,
+                        include_related: false,
+                        related_depth: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(
+            read["body"]
+                .as_str()
+                .unwrap()
+                .contains("Keep the same event id.")
+        );
+    }
+
+    /// A restore must bring back the page's metadata, not only its body:
+    /// the write path clears omitted metadata, so a restore that dropped it
+    /// would silently strip `kind`, `entities`, `abstract` and `relations`.
+    #[tokio::test]
+    async fn memory_restore_page_round_trips_frontmatter_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki.clone());
+        let payload = serde_json::json!({
+            "path": "notes/metadata.md", "body": "# Metadata\n\nDurable content.",
+            "kind": "rule", "entities": ["sqlite", "writer actor"],
+            "abstract": "One-line summary.",
+            "relations": {"fixes": ["gotchas/build"], "contradicts": ["decisions/old.md"]},
+            "tags": ["storage"], "pinned": true, "tier": "procedural"
+        });
+        server
+            .memory_write_page(
+                Parameters(serde_json::from_value(payload.clone()).unwrap()),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let path = PagePath::new("notes/metadata.md").unwrap();
+        let before = wiki.read_page(ws, proj, &path).unwrap();
+        server
+            .memory_delete_page(
+                Parameters(DeletePageArgs {
+                    scope: None,
+                    path: path.to_string(),
+                    project: None,
+                    workspace: None,
+                    expected_page_id: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+
+        let listed = result_json(
+            &server
+                .memory_restore_page(
+                    Parameters(restore_args(path.as_str(), None, None)),
+                    OptionalParts(test_parts_default()),
+                )
+                .await
+                .unwrap(),
+        );
+        let pre_delete = listed["checkpoints"][1]["rev"].as_str().unwrap().to_owned();
+        server
+            .memory_restore_page(
+                Parameters(restore_args(path.as_str(), Some(&pre_delete), None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+
+        let after = wiki.read_page(ws, proj, &path).unwrap();
+        for key in [
+            "kind",
+            "entities",
+            "abstract",
+            "relations",
+            "tags",
+            "pinned",
+            "tier",
+        ] {
+            assert_eq!(
+                after.frontmatter.get(key),
+                before.frontmatter.get(key),
+                "restore must keep `{key}`: {}",
+                after.frontmatter
+            );
+        }
+        assert_eq!(after.frontmatter["kind"], "rule");
+        assert_eq!(after.frontmatter["relations"], payload["relations"]);
+        assert_eq!(after.body, before.body);
+    }
+
+    /// Metadata that the write path would refuse is refused from a
+    /// checkpoint too, before anything is written.
+    #[test]
+    fn checkpoint_write_metadata_keeps_only_page_metadata_and_rejects_bad_shapes() {
+        let meta = checkpoint_write_metadata(&serde_json::json!({
+            "title": "ignored here", "kind": "rule", "entities": ["a"],
+            "abstract": null, "session_id": "x"
+        }))
+        .unwrap();
+        assert_eq!(meta.kind.as_deref(), Some("rule"));
+        assert_eq!(meta.entities, ["a"]);
+        assert!(meta.abstract_text.is_none());
+        assert!(
+            checkpoint_write_metadata(&serde_json::json!({ "entities": "not-a-list" })).is_err()
+        );
+        assert!(
+            checkpoint_write_metadata(&serde_json::json!({ "relations": { "blocks": ["x"] } }))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_restore_page_refuses_unknown_explicit_scope_and_bad_rev() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_wiki(wiki);
+
+        let foreign = server
+            .memory_restore_page(
+                Parameters(restore_args("notes/x.md", None, Some("typo"))),
+                OptionalParts(test_parts_default()),
+            )
+            .await;
+        assert!(
+            foreign.is_err(),
+            "an unknown explicit project must fail closed"
+        );
+
+        let bad_rev = server
+            .memory_restore_page(
+                Parameters(restore_args("notes/x.md", Some("deadbeef"), None)),
+                OptionalParts(test_parts_default()),
+            )
+            .await;
+        assert!(bad_rev.is_err(), "an unknown rev must not write anything");
     }
 
     #[tokio::test]
@@ -18172,6 +20288,128 @@ mod tests {
         );
     }
 
+    /// A malformed handoff or message id is caller input: it answers
+    /// `invalid params` (-32602) like a malformed session id, not an opaque
+    /// internal error, and keeps its message. Cancel trims the id the way
+    /// accept, pop and the admin routes already do.
+    #[tokio::test]
+    async fn malformed_handoff_and_message_ids_are_invalid_params() {
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let assert_invalid_params = |result: Result<CallToolResult, McpError>, what: &str| {
+            let err = result.expect_err("a malformed id must be refused");
+            assert_eq!(
+                err.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{what}: {err}"
+            );
+            assert!(
+                err.to_string().contains(&format!("invalid {what}")),
+                "{err}"
+            );
+        };
+
+        assert_invalid_params(
+            server
+                .memory_handoff_accept(
+                    Parameters(HandoffAcceptArgs {
+                        cwd: None,
+                        project: None,
+                        workspace: None,
+                        any_owner: None,
+                        handoff_id: Some("nope".into()),
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await,
+            "handoff_id",
+        );
+        assert_invalid_params(
+            server
+                .memory_handoff_cancel(
+                    Parameters(HandoffCancelArgs {
+                        handoff_id: "nope".into(),
+                        project: None,
+                        workspace: None,
+                        any_owner: None,
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await,
+            "handoff_id",
+        );
+        assert_invalid_params(
+            server
+                .memory_message_pop(
+                    Parameters(MessagePopArgs {
+                        message_id: Some("abc".into()),
+                        project: Some("scratch".into()),
+                        workspace: Some("default".into()),
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await,
+            "message_id",
+        );
+        assert_invalid_params(
+            server
+                .memory_message_cancel(
+                    Parameters(MessageCancelArgs {
+                        message_id: Some("abc".into()),
+                        project: Some("scratch".into()),
+                        workspace: Some("default".into()),
+                    }),
+                    OptionalParts(test_parts_default()),
+                )
+                .await,
+            "message_id",
+        );
+
+        // A valid id with surrounding whitespace still cancels.
+        let begin = server
+            .memory_handoff_begin(
+                Parameters(HandoffBeginArgs {
+                    summary: "padded id".into(),
+                    open_questions: vec![],
+                    next_steps: vec![],
+                    files_touched: vec![],
+                    cwd: Some("/tmp/aim".into()),
+                    project: None,
+                    workspace: None,
+                    shared: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .unwrap();
+        let begin_text = begin
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        let begin_json: serde_json::Value = serde_json::from_str(&begin_text).unwrap();
+        let handoff_id = begin_json["handoff_id"].as_str().unwrap().to_string();
+        let cancel = server
+            .memory_handoff_cancel(
+                Parameters(HandoffCancelArgs {
+                    handoff_id: format!(" {handoff_id}\n"),
+                    project: None,
+                    workspace: None,
+                    any_owner: None,
+                }),
+                OptionalParts(test_parts_default()),
+            )
+            .await
+            .expect("a whitespace-padded id names the same handoff");
+        let cancel_text = cancel
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap();
+        assert!(cancel_text.contains("\"cancelled\": true"), "{cancel_text}");
+    }
+
     #[tokio::test]
     async fn handoff_cancel_expires_open_handoff_and_clears_briefing_count() {
         let (_tmp, store, server, _ws, _pj) = setup_server().await;
@@ -18913,6 +21151,59 @@ mod tests {
         );
     }
 
+    /// A blank `session_id` means omitted and a padded one names the same
+    /// session, as in `memory_consolidate` and
+    /// `memory_read_session_observations`.
+    #[tokio::test]
+    async fn auto_improve_reads_blank_session_id_as_omitted_and_trims_padding() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let older = seed_short_completed_session(&store, ws, proj).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let latest = seed_short_completed_session(&store, ws, proj).await;
+
+        let llm: Arc<dyn LlmProvider> = Arc::new(PreflightMustNotCallLlm);
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            ws,
+            proj,
+        ));
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
+            .with_consolidator_arc(wiki, llm, consolidator);
+
+        for (raw, expected) in [("  ".to_string(), latest), (format!("  {older}\n"), older)] {
+            let response = call_tool_json(
+                server
+                    .memory_auto_improve(
+                        Parameters(AutoImproveArgs {
+                            session_id: Some(raw.clone()),
+                            ..auto_improve_args(None)
+                        }),
+                        OptionalParts(test_parts_default()),
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("session_id {raw:?}: {e:?}")),
+            );
+            assert_eq!(response["session_id"], expected.to_string(), "{raw:?}");
+        }
+    }
+
     #[tokio::test]
     async fn implicit_auto_improve_advances_past_preflight_skips() {
         let tmp = TempDir::new().unwrap();
@@ -18973,6 +21264,11 @@ mod tests {
         assert!(
             err.to_string().contains("no completed session without"),
             "the exhausted queue should explain how to rerun: {err}"
+        );
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "an exhausted implicit queue is the caller's to fix, as in memory_consolidate: {err}"
         );
 
         let explicit = call_tool_json(
@@ -19766,6 +22062,10 @@ mod tests {
         let result = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "Karpathy".into(),
                     limit: Some(99_999),
                     project: None,
@@ -19804,6 +22104,10 @@ mod tests {
         let err = server
             .memory_query(
                 Parameters(QueryArgs {
+                    kind: None,
+                    tier: None,
+                    path_prefix: None,
+                    tag: None,
                     query: "\"unbalanced".into(),
                     limit: Some(10),
                     project: None,

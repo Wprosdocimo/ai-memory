@@ -106,6 +106,11 @@ pub struct DecaySettings {
     pub observation_retention_days: i64,
     /// Observation rows deleted per prune transaction.
     pub observation_prune_batch: usize,
+    /// Age, in whole UTC calendar months after a month ends, past which the
+    /// forget sweep deletes that month's hook event ledger
+    /// (`log-YYYY-MM.md`). `0` disables the pass; nothing is deleted until an
+    /// operator opts in. The current and the previous month are never deleted.
+    pub ledger_retention_months: i64,
     /// A2 extractive tier-down (`[decay] compact_cold_episodic`). When `true`,
     /// the forget sweep COMPACTS a cold episodic page — keeping its L0 abstract,
     /// an L1 summary and the L2 keep-token set, dropping the prose — instead of
@@ -145,6 +150,7 @@ impl Default for DecaySettings {
             breadth_weight: 0.0,
             observation_retention_days: 0,
             observation_prune_batch: ai_memory_consolidate::DEFAULT_OBSERVATION_PRUNE_BATCH,
+            ledger_retention_months: 0,
             compact_cold_episodic: false,
             dedup_cold_clusters: false,
             dedup_min_pts: 0,
@@ -200,6 +206,15 @@ impl DecaySettings {
         ai_memory_consolidate::ObservationRetention {
             days: self.observation_retention_days,
             batch: self.observation_prune_batch,
+        }
+    }
+
+    /// Opt-in event ledger age bound consumed by the forget sweep. Disabled
+    /// (`months == 0`) unless `[decay] ledger_retention_months` is positive.
+    #[must_use]
+    pub fn ledger_retention(self) -> ai_memory_consolidate::LedgerRetention {
+        ai_memory_consolidate::LedgerRetention {
+            months: self.ledger_retention_months,
         }
     }
 
@@ -259,6 +274,17 @@ pub struct FallbackProfile {
 pub struct Config {
     /// Root data directory holding `wiki/`, `raw/`, `db/`, `models/`, `logs/`.
     pub data_dir: PathBuf,
+    /// Whether `--data-dir`, `AI_MEMORY_DATA_DIR` or the config file's
+    /// `data_dir` key chose [`Self::data_dir`], including an explicit value
+    /// equal to the platform default.
+    ///
+    /// Loader provenance, like [`Self::server_url_explicit`]. `install-mcp`
+    /// names the data dir in the bridge entries it writes only when it was
+    /// chosen, so a bridge installed against a non-default data dir reads the
+    /// same config and token as the hooks of that install, while a default
+    /// install keeps resolving its data dir when the bridge starts.
+    #[serde(skip)]
+    pub data_dir_explicit: bool,
     /// HTTP bind address used by `ai-memory serve`.
     pub bind: String,
     /// Idle-time (seconds) before the OS starts probing an accepted `serve`
@@ -270,7 +296,31 @@ pub struct Config {
     /// with `AI_MEMORY_TCP_KEEPALIVE_SECS`.
     pub tcp_keepalive_secs: u64,
     /// Base URL used by thin-client CLI commands to contact the running server.
+    ///
+    /// When neither this file nor `AI_MEMORY_SERVER_URL` sets it, the loader
+    /// derives it from [`Self::bind`] so a thin client reaches the server this
+    /// same config starts (#1269); see [`Self::server_url_derived_from_bind`].
     pub server_url: String,
+    /// Whether `server_url` was derived from `bind` rather than set by the
+    /// config file or the environment (#1269).
+    ///
+    /// Kept separate from `server_url` itself so
+    /// [`Self::server_url_configured`] can keep answering "did the operator
+    /// choose the URL" -- the question `install-hooks` / `install-mcp` ask --
+    /// without a derived value being mistaken for a deliberate one.
+    ///
+    /// Not deserialized from the file: it describes what the loader did, not
+    /// something an operator states.
+    #[serde(skip)]
+    pub server_url_derived_from_bind: bool,
+    /// Whether the operator explicitly set `server_url` in config or the
+    /// process environment, including an explicit value equal to the default.
+    ///
+    /// This is loader provenance, not persisted configuration. Comparing the
+    /// loaded value with [`DEFAULT_SERVER_URL`] loses this distinction and can
+    /// make installers overwrite an intentional default URL (#1269 follow-up).
+    #[serde(skip)]
+    pub server_url_explicit: bool,
     /// Optional override for the GitHub Releases base URL used by
     /// `ai-memory upgrade` (archive + `.sha256` download). Empty/unset
     /// means `https://github.com/akitaonrails/ai-memory/releases`. Set via
@@ -528,6 +578,8 @@ pub struct Config {
     pub decay: DecaySettings,
     /// Server-side scheduled maintenance. Jobs run outside hook latency.
     pub maintenance: MaintenanceSettings,
+    /// Server-side session lifecycle (idle auto-end tick).
+    pub sessions: SessionsSettings,
     /// Lower edge (inclusive) of `memory_lint`'s A5 zero-LLM
     /// contradiction-detection cosine-similarity band. Two cold pages whose
     /// embeddings sit in `[contradiction_band_min, contradiction_band_max)`
@@ -1081,6 +1133,9 @@ pub(crate) struct ResolvedTokenFile {
     /// missing or blank leaves [`AuthSettings::bearer_token`] unset, and
     /// `serve` refuses to start rather than run open.
     pub(crate) loaded: bool,
+    /// Whether [`discover_root_token`] found it rather than the config naming
+    /// it, so a credential this install chose can outrank it.
+    pub(crate) discovered: bool,
 }
 
 impl AuthSettings {
@@ -1105,6 +1160,16 @@ impl AuthSettings {
         self.token_file.as_ref().map(|file| file.path.as_path())
     }
 
+    /// The bearer the environment, the inline key or `[auth].bearer_token_file`
+    /// supplied, leaving out a root token only [`discover_root_token`] found.
+    #[must_use]
+    pub(crate) fn configured_bearer_token(&self) -> Option<&str> {
+        if self.token_file.as_ref().is_some_and(|file| file.discovered) {
+            return None;
+        }
+        self.bearer_token.as_deref()
+    }
+
     /// The configured token file when it could not supply a token.
     #[must_use]
     pub(crate) fn missing_token_file(&self) -> Option<&Path> {
@@ -1119,7 +1184,11 @@ impl AuthSettings {
     /// re-renders wiring in the same process.
     pub(crate) fn adopt_token_file(&mut self, path: PathBuf, token: String) {
         self.bearer_token = Some(token);
-        self.token_file = Some(ResolvedTokenFile { path, loaded: true });
+        self.token_file = Some(ResolvedTokenFile {
+            path,
+            loaded: true,
+            discovered: false,
+        });
     }
 }
 
@@ -1166,6 +1235,7 @@ fn apply_bearer_token_file(auth: &mut AuthSettings, ctx: &TokenFileContext<'_>) 
     auth.token_file = Some(ResolvedTokenFile {
         path,
         loaded: token.is_some(),
+        discovered: false,
     });
     auth.bearer_token = token;
     Ok(())
@@ -1204,7 +1274,11 @@ fn discover_root_token(auth: &mut AuthSettings, ctx: &TokenFileContext<'_>) {
     if profile_named_default {
         return;
     }
-    auth.token_file = Some(ResolvedTokenFile { path, loaded: true });
+    auth.token_file = Some(ResolvedTokenFile {
+        path,
+        loaded: true,
+        discovered: true,
+    });
     auth.bearer_token = Some(token);
 }
 
@@ -1255,8 +1329,9 @@ pub struct RoutingSettings {
 }
 
 /// `[ingest]`: tool events the server drops whatever the client sends
-/// (#1241). Both lists are empty by default and apply to every project on the
-/// server. Validated once by [`Config::load`] into [`Self::drop_list`].
+/// (#1241). The tool lists and the event-kind list are all empty by default
+/// and apply to every project on the server. Validated once by
+/// [`Config::load`] into [`Self::drop_list`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IngestSettings {
@@ -1264,10 +1339,23 @@ pub struct IngestSettings {
     pub drop_tool_use_id_prefixes: Vec<String>,
     /// Drop a tool event whose tool name equals one of these exactly.
     pub drop_tool_names: Vec<String>,
+    /// Drop whole hook event kinds, whatever the client sends. Each value is a
+    /// hook event kind (e.g. `pre-tool-use`); a matching event is acknowledged
+    /// and discarded before it is stored. Empty by default (nothing dropped).
+    ///
+    /// `session-start` and `session-end` are rejected at load: the router uses
+    /// them to open and close a session, so dropping them would strand the
+    /// session state machine. Accepts either a TOML/JSON sequence
+    /// (`["pre-tool-use"]`) or a comma-separated env string
+    /// (`AI_MEMORY_INGEST__DROP_EVENTS=pre-tool-use`).
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub drop_events: Vec<String>,
     /// The validated list the hook router checks. Set by [`Config::load`];
-    /// never read from or written to a config file.
+    /// never read from or written to a config file. Kept off the `Config`
+    /// stack frame because that value is constructed in short-stack CLI
+    /// entry points on Windows.
     #[serde(skip)]
-    pub drop_list: ai_memory_hooks::IngestDropList,
+    pub drop_list: Box<ai_memory_hooks::IngestDropList>,
 }
 
 /// Client-side hook spool retry policy.
@@ -1309,9 +1397,12 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             data_dir: default_data_dir(),
+            data_dir_explicit: false,
             bind: DEFAULT_BIND.into(),
             tcp_keepalive_secs: DEFAULT_TCP_KEEPALIVE_SECS,
             server_url: DEFAULT_SERVER_URL.into(),
+            server_url_derived_from_bind: false,
+            server_url_explicit: false,
             release_base_url: None,
             base_path: String::new(),
             home_dir: None,
@@ -1344,6 +1435,7 @@ impl Default for Config {
             embedding_document_prefix: None,
             decay: DecaySettings::default(),
             maintenance: MaintenanceSettings::default(),
+            sessions: SessionsSettings::default(),
             contradiction_band_min: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_LOW,
             contradiction_band_max: ai_memory_consolidate::DEFAULT_CONTRADICTION_SIM_HIGH,
             dream: DreamSettings::default(),
@@ -1442,6 +1534,10 @@ fn validate_run_profiles(run: &RunSettings) -> Result<()> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConsolidationSettings {
+    /// Add bounded literal diagnostics from observations omitted or truncated
+    /// by the normal projection. Off by default because it widens the subset
+    /// of captured text sent to the configured provider.
+    pub verbatim_residue: bool,
     /// Approximate token target for the entire consolidation prompt:
     /// observation dump, current page body, system prompt, page conventions,
     /// slot snapshots, and the structured-output schema.
@@ -1466,6 +1562,7 @@ pub struct ConsolidationSettings {
 impl Default for ConsolidationSettings {
     fn default() -> Self {
         Self {
+            verbatim_residue: false,
             max_input_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_INPUT_TOKENS,
             max_output_tokens: ai_memory_consolidate::DEFAULT_CONSOLIDATION_MAX_OUTPUT_TOKENS,
             input_token_safety_margin:
@@ -1783,6 +1880,21 @@ impl Default for MaintenanceSettings {
     }
 }
 
+/// `[sessions]` server-side session lifecycle.
+///
+/// Env form: `AI_MEMORY_SESSIONS__IDLE_END_AFTER_HOURS=24`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionsSettings {
+    /// Hours of silence after which the maintenance tick ends an open
+    /// session that never received a `SessionEnd` (crashed harness, closed
+    /// terminal, timed-out hook): summary page + consolidation job, no
+    /// handoff. `0` (the default) disables the tick — the explicit
+    /// `finalize-on-exit` / `repair-backfill-timestamps` path stays the only
+    /// end for sessions an operator may still come back to.
+    pub idle_end_after_hours: u32,
+}
+
 /// `[dream]` — the opt-in LLM dream pass (docs/design-memory-aging.md §B2–B4).
 ///
 /// OFF by default (`enabled = false`): the scheduled job is not started, and even
@@ -1973,7 +2085,8 @@ pub struct SearchSettings {
 #[serde(default)]
 pub struct FtsSettings {
     /// Words dropped from a bare (non-explicit-syntax) natural-language FTS
-    /// query before the OR-join
+    /// query, and from the bag-of-words fallback for syntax that does not
+    /// parse, before the OR-join
     /// (`ai_memory_store::fts_query::prepare_fts5_query`).
     ///
     /// - **Absent** (the default, `None`): the built-in English list —
@@ -1995,7 +2108,8 @@ pub struct FtsSettings {
     /// `"não"`. Also note the filter matches whitespace-split raw tokens
     /// before any punctuation handling, so an entry never matches a token
     /// with attached punctuation (`"de,"`, `"que?"`) — the same limitation
-    /// English stopwords have always had.
+    /// English stopwords have always had. The fallback for syntax that does
+    /// not parse strips quotes and parens first, and keeps quoted words.
     ///
     /// A non-English or mixed-language wiki should set this to that
     /// language's function words, or to `[]`: left unset, only the built-in
@@ -2068,6 +2182,82 @@ impl FtsSettings {
         }
         Ok(())
     }
+}
+
+/// Point `server_url` at the server `bind` starts, when nothing named one
+/// (#1269).
+///
+/// Only runs when neither the config file nor `AI_MEMORY_SERVER_URL` set
+/// `server_url` (`explicit_server_url`), even to the default URL itself.
+///
+/// Rules, matching the reporter's proposal:
+/// - an unspecified address becomes loopback, because it is not itself a
+///   reachable target (`0.0.0.0` -> `127.0.0.1`, `[::]` -> `[::1]`);
+/// - any other host is used as given, hostname included, since the server may
+///   bind a name this process cannot resolve the same way;
+/// - a `bind` that does not parse as `host:port` leaves the default URL alone
+///   rather than building one out of a fragment. `serve` still rejects the bad
+///   bind at startup, so the operator sees the real error there.
+///
+/// The default `bind` derives exactly [`DEFAULT_SERVER_URL`], so an install
+/// that never touched either key is byte-identical to before.
+fn derive_server_url_from_bind(config: &mut Config, explicit_server_url: bool) {
+    if explicit_server_url || config.server_url != DEFAULT_SERVER_URL {
+        return;
+    }
+    // A bind that differs from the default is the case this exists for; the
+    // default derives the same URL, so skip the parse entirely for it.
+    if config.bind == DEFAULT_BIND {
+        return;
+    }
+    let Some(url) = server_url_for_bind(&config.bind) else {
+        return;
+    };
+    // A bind that resolves to the default URL anyway (a container's
+    // `0.0.0.0:49374`) changes nothing, so it is not marked derived.
+    if url == DEFAULT_SERVER_URL {
+        return;
+    }
+    config.server_url = url;
+    config.server_url_derived_from_bind = true;
+}
+
+/// The client URL for one `bind` value, or `None` when it is not a
+/// `host:port` this can turn into a URL.
+///
+/// Parsed by hand rather than with `SocketAddr` so a HOSTNAME survives: a
+/// server may bind `memory.lan:9000`, and resolving it here would both change
+/// which address the client dials and fail outright on a host this process
+/// cannot resolve but the server can.
+fn server_url_for_bind(bind: &str) -> Option<String> {
+    let bind = bind.trim();
+    // Split on the LAST colon so an IPv6 literal in brackets, which contains
+    // colons of its own, keeps its host in one piece.
+    let (host, port) = bind.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    // Port 0 asks the OS for any free port, so no client can know it in
+    // advance; keep the default URL.
+    if host.is_empty() || port == 0 {
+        return None;
+    }
+    let host = if host == "0.0.0.0" {
+        "127.0.0.1".to_string()
+    } else if host == "[::]" {
+        "[::1]".to_string()
+    } else if host.starts_with('[') {
+        // An IPv6 literal must carry its brackets into the URL.
+        if !host.ends_with(']') {
+            return None;
+        }
+        host.to_string()
+    } else if host.contains(':') {
+        // A bare IPv6 literal, or a bracketed one split wrong. Rejecting is
+        // safer than emitting a URL whose host cannot be read back.
+        return None;
+    } else {
+        host.to_string()
+    };
+    Some(format!("http://{host}:{port}"))
 }
 
 /// Parse the `AI_MEMORY_SEARCH_FTS_STOPWORDS` env override into
@@ -2174,6 +2364,17 @@ impl Config {
         if let Some(token) = runtime_env.auth_token.clone() {
             config.auth.bearer_token = Some(token);
         }
+        // Whether the file or the environment named a server URL. `server_url`
+        // is the one key #1269 derives rather than only defaulting, and the
+        // derivation must not fire when either source set it, even to the
+        // default URL itself, so the file is asked for the key rather than
+        // the loaded value being compared against the default.
+        let explicit_server_url = runtime_env.server_url.is_some()
+            || (resolved_config_path.exists()
+                && Figment::from(Toml::file(&resolved_config_path))
+                    .find_value("server_url")
+                    .is_ok());
+        config.server_url_explicit = explicit_server_url;
         if let Some(server_url) = runtime_env.server_url.clone() {
             config.server_url = server_url;
         }
@@ -2213,6 +2414,14 @@ impl Config {
         // so the #103 catch-all guard is not inert there.
         config.home_dir = runtime_env.home_dir.as_deref().and_then(normalize_home_dir);
 
+        // As with `server_url`, the file is asked for the key: a chosen dir
+        // equal to the default still counts as chosen.
+        config.data_dir_explicit = cli_data_dir.is_some()
+            || runtime_env.data_dir.is_some()
+            || (resolved_config_path.exists()
+                && Figment::from(Toml::file(&resolved_config_path))
+                    .find_value("data_dir")
+                    .is_ok());
         // CLI override always wins (figment doesn't see it because clap has
         // already parsed the flag into `cli_data_dir`).
         if let Some(dir) = cli_data_dir {
@@ -2222,6 +2431,13 @@ impl Config {
         }
 
         config.data_dir = canonicalise_or_keep(&config.data_dir);
+        // #1269: with neither the file nor the environment naming a server
+        // URL, reach the server this same config starts rather than the
+        // compiled-in default. A thin client that ignored `bind` either failed
+        // (nothing on the default port) or, worse, operated on whatever
+        // server WAS on the default port -- which is how the reporter wrote
+        // test pages into their real store.
+        derive_server_url_from_bind(&mut config, explicit_server_url);
         apply_bearer_token_file(
             &mut config.auth,
             &TokenFileContext {
@@ -2234,6 +2450,19 @@ impl Config {
         config.runtime_env = runtime_env;
 
         validate_run_profiles(&config.run)?;
+
+        // The idle auto-end tick turns `idle_end_after_hours` into a
+        // microsecond cutoff: a value above a year is a configuration
+        // mistake (a typo of minutes for days), and a huge value would also
+        // push the cutoff microsecond arithmetic toward `i64` overflow.
+        // Bound it at load rather than at 3am inside the tick.
+        if config.sessions.idle_end_after_hours > 8760 {
+            anyhow::bail!(
+                "sessions.idle_end_after_hours must be 0 (off) or at most 8760 hours \
+                 (one year); got {}",
+                config.sessions.idle_end_after_hours
+            );
+        }
 
         if !config.decay.breadth_weight.is_finite() || config.decay.breadth_weight < 0.0 {
             anyhow::bail!(
@@ -2274,6 +2503,14 @@ impl Config {
         if config.decay.observation_prune_batch == 0 {
             anyhow::bail!("decay.observation_prune_batch must be greater than zero");
         }
+        // The same fail-closed rule for the opt-in ledger sweep: a negative
+        // age is not a cutoff, and this pass deletes files.
+        if config.decay.ledger_retention_months < 0 {
+            anyhow::bail!(
+                "decay.ledger_retention_months must be greater than or equal to zero \
+                 (0 disables ledger deletion)"
+            );
+        }
         // A5 zero-LLM contradiction band (`memory_lint`): both edges must be
         // finite and inside cosine similarity's own range, and the band must
         // be non-empty. An inverted or out-of-range band would either
@@ -2302,11 +2539,14 @@ impl Config {
         if let Err(message) = config.search.fts.validate() {
             anyhow::bail!("{message}");
         }
-        config.ingest.drop_list = ai_memory_hooks::IngestDropList::new(
-            config.ingest.drop_tool_use_id_prefixes.clone(),
-            config.ingest.drop_tool_names.clone(),
-        )
-        .map_err(|message| anyhow::anyhow!(message))?;
+        config.ingest.drop_list = Box::new(
+            ai_memory_hooks::IngestDropList::new(
+                config.ingest.drop_tool_use_id_prefixes.clone(),
+                config.ingest.drop_tool_names.clone(),
+                &config.ingest.drop_events,
+            )
+            .map_err(|message| anyhow::anyhow!(message))?,
+        );
         // A4 entropy filter thresholds: reject an unusable threshold at startup
         // rather than silently ignoring it on the first experience pass.
         if let Err(message) = config
@@ -2449,10 +2689,19 @@ impl Config {
         Ok(config)
     }
 
-    /// Whether the server URL came from config/env instead of the default.
+    /// Whether the server URL came from config/env instead of being derived
+    /// from `bind` or left at the default.
+    ///
+    /// Deliberately unchanged by the #1269 derivation: `install-hooks` and
+    /// `install-mcp` read this to decide whether the operator chose the URL
+    /// themselves, and a user who only edited `bind` did not. `server_url` can
+    /// therefore differ from `DEFAULT_SERVER_URL` without this being true,
+    /// which is exactly why [`Self::server_url_derived_from_bind`] exists.
     #[must_use]
     pub fn server_url_configured(&self) -> bool {
-        self.server_url != DEFAULT_SERVER_URL || self.runtime_env.server_url.is_some()
+        self.server_url_explicit
+            || self.server_url != DEFAULT_SERVER_URL && !self.server_url_derived_from_bind
+            || self.runtime_env.server_url.is_some()
     }
 
     /// Parse [`Self::llm_headers`] into typed header material.
@@ -2977,9 +3226,10 @@ impl Config {
     /// Base URL for `provider`, from the two sources that can supply one.
     ///
     /// An explicit ai-memory setting (`llm_base_url` in `config.toml`, or
-    /// `AI_MEMORY_LLM_BASE_URL`) configures any provider: naming ai-memory is
-    /// how an operator says they mean it, and proxying a vendor endpoint is a
-    /// legitimate deployment.
+    /// `AI_MEMORY_LLM_BASE_URL`) configures every HTTP API provider: naming
+    /// ai-memory is how an operator says they mean it, and proxying a vendor
+    /// endpoint is a legitimate deployment. The ChatGPT backend
+    /// (`openai-oauth`, `codex`) and `cursor`'s CLI take no override.
     ///
     /// The bare `LLM_BASE_URL` is different in kind — a cross-tool convention
     /// an operator exports once for a local Ollama and forgets. It reaches
@@ -3214,11 +3464,42 @@ pub fn hook_auth_header_path_in(data_dir: &Path) -> PathBuf {
 /// Propagates IO failures from creating the data dir or writing either file.
 pub fn store_hook_auth_token(data_dir: &Path, token: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(data_dir)?;
-    write_secret(&hook_auth_token_path_in(data_dir), token)?;
-    write_secret(
-        &hook_auth_header_path_in(data_dir),
-        &format!("Authorization: Bearer {token}\n"),
-    )
+    let token_path = hook_auth_token_path_in(data_dir);
+    let header_path = hook_auth_header_path_in(data_dir);
+    let previous_token = read_optional_secret_bytes(&token_path)?;
+    let previous_header = read_optional_secret_bytes(&header_path)?;
+
+    write_secret(&token_path, token)?;
+    if let Err(error) = write_secret(&header_path, &format!("Authorization: Bearer {token}\n")) {
+        let token_rollback = restore_secret_bytes(&token_path, previous_token.as_deref());
+        let header_rollback = restore_secret_bytes(&header_path, previous_header.as_deref());
+        if let Err(rollback) = token_rollback.and(header_rollback) {
+            return Err(std::io::Error::other(format!(
+                "writing hook credential pair failed ({error}); rollback also failed ({rollback})"
+            )));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn read_optional_secret_bytes(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn restore_secret_bytes(path: &Path, previous: Option<&[u8]>) -> std::io::Result<()> {
+    match previous {
+        Some(bytes) => write_secret_bytes(path, bytes),
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        },
+    }
 }
 
 /// Remove a persisted bearer pair. Absent files are not an error.
@@ -3258,6 +3539,10 @@ pub(crate) fn read_trimmed_secret(path: &Path) -> Option<String> {
 /// The mode is set on the handle before any bytes are written on Unix, so the
 /// secret is never briefly world-readable between `create` and `set_permissions`.
 fn write_secret(path: &Path, contents: &str) -> std::io::Result<()> {
+    write_secret_bytes(path, contents.as_bytes())
+}
+
+fn write_secret_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write as _;
@@ -3268,7 +3553,7 @@ fn write_secret(path: &Path, contents: &str) -> std::io::Result<()> {
             .truncate(true)
             .mode(0o600)
             .open(path)?;
-        file.write_all(contents.as_bytes())
+        file.write_all(contents)
     }
     #[cfg(not(unix))]
     {
@@ -3303,7 +3588,15 @@ fn canonicalise_or_keep(p: &Path) -> PathBuf {
     {
         return canon_parent.join(name);
     }
-    p.to_path_buf()
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    // A nested path may have no existing ancestor beyond the current
+    // directory yet. Keep the invocation-time meaning when this path is later
+    // embedded in an MCP entry launched from an unrelated project directory.
+    std::env::current_dir()
+        .map(|cwd| cwd.join(p))
+        .unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Normalize home for prefix-match comparisons: accept either slash spelling,
@@ -3404,6 +3697,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_invalid_header_target_cannot_partially_replace_the_token() {
+        let tmp = TempDir::new().unwrap();
+        let dd = tmp.path().join("data");
+        std::fs::create_dir_all(hook_auth_header_path_in(&dd)).unwrap();
+
+        let error = store_hook_auth_token(&dd, "must-not-stick").unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!hook_auth_token_path_in(&dd).exists());
+    }
+
+    #[test]
+    fn a_nested_nonexistent_relative_data_dir_becomes_absolute() {
+        let relative = Path::new("target/nonexistent-ai-memory-test/data");
+        let resolved = canonicalise_or_keep(relative);
+        assert!(resolved.is_absolute(), "{}", resolved.display());
+        assert!(resolved.ends_with(relative));
+    }
+
     /// Absent, empty, and whitespace-only files all read as "no token" rather
     /// than as an empty bearer, which would send `Authorization: Bearer `.
     #[test]
@@ -3427,6 +3739,41 @@ mod tests {
         clear_hook_auth_token(&dd).unwrap();
         assert!(read_hook_auth_token(&dd).is_none());
         clear_hook_auth_token(&dd).expect("clearing twice must not error");
+    }
+
+    /// Adversarial: the stored hook key is a client credential, read by the
+    /// hooks and, as a last resort, by `mcp-bridge`. `Config::load` must never
+    /// adopt it, or `serve` on the same data dir would start requiring that
+    /// key and accepting it as its bearer. Control: a key named by
+    /// `[auth].bearer_token_file` is adopted.
+    #[test]
+    fn config_load_never_adopts_the_stored_hook_key() {
+        let tmp = TempDir::new().unwrap();
+        let dd = tmp.path().join("data");
+        store_hook_auth_token(&dd, "aim_hook_key").unwrap();
+        let config_path = dd.join("config.toml");
+        std::fs::write(&config_path, "bind = \"127.0.0.1:49921\"\n").unwrap();
+        let cfg = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(dd.clone()),
+            RuntimeEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(cfg.auth.bearer_token, None);
+        assert!(cfg.auth.token_file_path().is_none());
+
+        std::fs::write(
+            &config_path,
+            "bind = \"127.0.0.1:49921\"\n[auth]\nbearer_token_file = \"auth-token\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(dd.clone()),
+            RuntimeEnv::default(),
+        )
+        .unwrap();
+        assert_eq!(cfg.auth.bearer_token.as_deref(), Some("aim_hook_key"));
     }
     use super::*;
     use rstest::rstest;
@@ -3511,6 +3858,305 @@ mod tests {
         }
     }
 
+    /// The shipped `config.default.toml` must actually load.
+    ///
+    /// It is `include_str!`-ed by `init` and written as-is, so a template
+    /// that does not parse would only surface when someone ran `init` and
+    /// started the server. Comments added by #1269 are the kind of edit that
+    /// can break it silently (a stray quote, a line that stops being a
+    /// comment), and nothing tested the file itself.
+    #[test]
+    fn the_shipped_default_config_parses() {
+        const TEMPLATE: &str = include_str!("../templates/config.default.toml");
+        let cfg = load_with_toml(TEMPLATE).expect("config.default.toml must load");
+        assert_eq!(cfg.bind, DEFAULT_BIND);
+        assert_eq!(
+            cfg.server_url, DEFAULT_SERVER_URL,
+            "the template leaves server_url unset, so the default bind derives the default URL"
+        );
+        assert!(
+            !cfg.server_url_derived_from_bind,
+            "the default bind short-circuits the derivation, so nothing is marked derived"
+        );
+    }
+
+    /// #1506: an example table in the shipped config must not capture the
+    /// top-level examples below it.
+    ///
+    /// A TOML table header owns every key after it. The commented
+    /// `[run.profiles.work.env]` and `[ingest]` examples sat above top-level
+    /// examples such as `reranker` and `capture_assistant`, so an operator who
+    /// uncommented both put the top-level key inside the table: `[ingest]`
+    /// dropped it without a warning, and the profile's string-only env map
+    /// refused it or exported it to the harness. Top-level keys end at the
+    /// first real table, so the example tables belong below it, and
+    /// uncommenting every example must still set the keys they document.
+    #[test]
+    fn the_shipped_default_config_examples_keep_their_tables() {
+        const TEMPLATE: &str = include_str!("../templates/config.default.toml");
+        // A one-line example is `# ` followed by a line that parses as TOML on
+        // its own. Indented examples stay commented: some are alternatives
+        // for the same key, others span several lines.
+        fn example(line: &str) -> Option<&str> {
+            line.strip_prefix("# ")
+                .filter(|code| !code.starts_with(' '))
+                .filter(|code| code.parse::<toml_edit::DocumentMut>().is_ok())
+        }
+
+        let first_table = TEMPLATE
+            .lines()
+            .position(|line| line.trim_start().starts_with('['))
+            .expect("the template declares tables");
+        for line in TEMPLATE.lines().take(first_table) {
+            let example_table = example(line).is_some_and(|code| code.starts_with('['));
+            assert!(
+                !example_table,
+                "{line:?} is above the first table and would capture top-level keys"
+            );
+        }
+
+        let uncommented = TEMPLATE
+            .lines()
+            .map(|line| example(line).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cfg = load_with_toml(&uncommented).expect("the uncommented template must load");
+        assert_eq!(cfg.reranker.as_deref(), Some("llm"));
+        assert_eq!(
+            cfg.run.profiles["work"].env.keys().collect::<Vec<_>>(),
+            ["ANTHROPIC_BASE_URL", "CLAUDE_CONFIG_DIR"]
+        );
+        assert_eq!(cfg.ingest.drop_tool_use_id_prefixes, ["toolu_plugin_"]);
+        assert_eq!(cfg.ingest.drop_tool_names, ["mcp__noisy__poll"]);
+    }
+
+    /// #1269: a thin client must reach the server the SAME config starts.
+    ///
+    /// `server_url` defaulted to a constant and was never derived from `bind`,
+    /// so `ai-memory --data-dir X status` called `127.0.0.1:49374` whatever
+    /// `bind` said. With nothing listening there the command failed; with the
+    /// default install's server listening there it silently operated on the
+    /// WRONG store, which is how the reporter wrote twelve test pages into
+    /// their real one.
+    ///
+    /// Each case here is one cell of the truth table: what the file sets, what
+    /// the environment sets, and the URL the client must end up using.
+    #[test]
+    fn server_url_is_derived_from_a_custom_bind() {
+        // No `server_url` anywhere: the bind decides. The port differs from
+        // the default on purpose, so a client that ignored `bind` would be
+        // caught rather than accidentally matching.
+        let cfg = load_with_toml("bind = \"127.0.0.1:49921\"\n").unwrap();
+        assert_eq!(cfg.bind, "127.0.0.1:49921");
+        assert_eq!(cfg.server_url, "http://127.0.0.1:49921");
+
+        // A LAN bind is used as given: the operator named a real interface.
+        let cfg = load_with_toml("bind = \"192.0.2.10:8080\"\n").unwrap();
+        assert_eq!(cfg.server_url, "http://192.0.2.10:8080");
+
+        // A hostname is passed through rather than resolved: the server may
+        // bind a name this process cannot resolve the same way.
+        let cfg = load_with_toml("bind = \"memory.lan:9000\"\n").unwrap();
+        assert_eq!(cfg.server_url, "http://memory.lan:9000");
+    }
+
+    /// An unspecified bind is not a reachable address, so it maps to loopback
+    /// the way a client would have to reach it anyway.
+    #[test]
+    fn server_url_maps_an_unspecified_bind_to_loopback() {
+        let cfg = load_with_toml("bind = \"0.0.0.0:49921\"\n").unwrap();
+        assert_eq!(cfg.server_url, "http://127.0.0.1:49921");
+
+        let cfg = load_with_toml("bind = \"[::]:49921\"\n").unwrap();
+        assert_eq!(
+            cfg.server_url, "http://[::1]:49921",
+            "an IPv6 unspecified address must map to the IPv6 loopback, not to 0.0.0.0"
+        );
+
+        // A specific IPv6 address is used as given, brackets included.
+        let cfg = load_with_toml("bind = \"[::1]:49921\"\n").unwrap();
+        assert_eq!(cfg.server_url, "http://[::1]:49921");
+    }
+
+    /// An explicit `server_url` still wins, in the file and in the
+    /// environment. This is the control for the derivation: without it a
+    /// change that ignored the operator's own value would look correct.
+    #[test]
+    fn an_explicit_server_url_still_wins_over_a_custom_bind() {
+        let cfg =
+            load_with_toml("bind = \"127.0.0.1:49921\"\nserver_url = \"https://memory.example\"\n")
+                .unwrap();
+        assert_eq!(cfg.server_url, "https://memory.example");
+
+        // The environment wins over the file, as it does for every other key.
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "bind = \"127.0.0.1:49921\"\nserver_url = \"https://from-file.example\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv {
+                server_url: Some("https://from-env.example".into()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.server_url, "https://from-env.example");
+    }
+
+    /// An explicit `server_url` that happens to name the default URL is still
+    /// explicit: neither the file nor the environment may be overridden by a
+    /// custom `bind` just because the value matches the default.
+    #[test]
+    fn an_explicit_default_server_url_is_not_rederived_from_bind() {
+        let cfg = load_with_toml(&format!(
+            "bind = \"127.0.0.1:49921\"\nserver_url = \"{DEFAULT_SERVER_URL}\"\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
+        assert!(!cfg.server_url_derived_from_bind);
+        assert!(cfg.server_url_configured());
+
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "bind = \"127.0.0.1:49921\"\n").unwrap();
+        let cfg = Config::load_with_runtime_env(
+            Some(&config_path),
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv {
+                server_url: Some(DEFAULT_SERVER_URL.into()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
+        assert!(!cfg.server_url_derived_from_bind);
+        assert!(cfg.server_url_configured());
+    }
+
+    /// `data_dir_explicit` records whether the flag, the environment or the
+    /// file chose the data dir, never whether it differs from the default.
+    #[test]
+    fn data_dir_explicit_tracks_who_chose_the_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "bind = \"127.0.0.1:49921\"\n").unwrap();
+        let load = |config_path: &Path, cli: Option<PathBuf>, env: Option<PathBuf>| {
+            Config::load_with_runtime_env(
+                Some(config_path),
+                cli,
+                RuntimeEnv {
+                    data_dir: env,
+                    ..RuntimeEnv::default()
+                },
+            )
+            .unwrap()
+        };
+
+        assert!(!load(&config_path, None, None).data_dir_explicit);
+        assert!(load(&config_path, Some(tmp.path().to_path_buf()), None).data_dir_explicit);
+        assert!(load(&config_path, None, Some(tmp.path().to_path_buf())).data_dir_explicit);
+
+        // The file's key counts even when it names the default dir itself.
+        let from_file = tmp.path().join("from-file.toml");
+        std::fs::write(
+            &from_file,
+            format!("data_dir = {:?}\n", default_data_dir().to_string_lossy()),
+        )
+        .unwrap();
+        assert!(load(&from_file, None, None).data_dir_explicit);
+    }
+
+    /// A bind that maps onto the default URL (an unspecified address on the
+    /// default port, as containers bind) is not a derivation.
+    #[test]
+    fn a_bind_that_maps_to_the_default_url_is_not_marked_derived() {
+        let cfg = load_with_toml("bind = \"0.0.0.0:49374\"\n").unwrap();
+        assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
+        assert!(!cfg.server_url_derived_from_bind);
+    }
+
+    /// Port 0 picks a free port at startup, so no client URL can be derived
+    /// from it; the default URL stays.
+    #[test]
+    fn a_port_zero_bind_keeps_the_default_server_url() {
+        for bind in ["127.0.0.1:0", "0.0.0.0:0", "[::1]:0"] {
+            let cfg = load_with_toml(&format!("bind = \"{bind}\"\n")).unwrap();
+            assert_eq!(cfg.server_url, DEFAULT_SERVER_URL, "{bind}");
+            assert!(!cfg.server_url_derived_from_bind, "{bind}");
+        }
+    }
+
+    /// #1269: deriving the URL must not make an operator look like they
+    /// configured it.
+    ///
+    /// `server_url_configured()` is what `install-hooks` and `install-mcp`
+    /// read to decide whether to infer the URL from an existing MCP entry
+    /// rather than fall back to the compiled default. Someone who only edited
+    /// `bind` has not chosen a `server_url`, so the answer has to stay false
+    /// or those installers change behaviour for them.
+    #[test]
+    fn a_derived_server_url_is_not_reported_as_configured() {
+        let cfg = load_with_toml("bind = \"127.0.0.1:49921\"\n").unwrap();
+        assert_eq!(cfg.server_url, "http://127.0.0.1:49921");
+        assert!(
+            cfg.server_url_derived_from_bind,
+            "the loader must record that it derived the value"
+        );
+        assert!(
+            !cfg.server_url_configured(),
+            "a bind-derived URL is not an operator-configured one"
+        );
+
+        // Control: a value the operator actually wrote is still reported as
+        // configured, and is not marked derived.
+        let cfg = load_with_toml("server_url = \"https://memory.example\"\n").unwrap();
+        assert!(!cfg.server_url_derived_from_bind);
+        assert!(cfg.server_url_configured());
+
+        // Control: the environment counts as explicit too, even when it names
+        // the default URL.
+        let tmp = TempDir::new().unwrap();
+        let cfg = Config::load_with_runtime_env(
+            None,
+            Some(tmp.path().to_path_buf()),
+            RuntimeEnv {
+                server_url: Some(DEFAULT_SERVER_URL.into()),
+                ..RuntimeEnv::default()
+            },
+        )
+        .unwrap();
+        assert!(!cfg.server_url_derived_from_bind);
+        assert!(cfg.server_url_configured());
+    }
+
+    /// The default install must be byte-identical to before this change: the
+    /// default bind derives exactly the default URL.
+    #[test]
+    fn the_default_bind_still_resolves_to_the_default_url() {
+        let cfg = load_with_toml("").unwrap();
+        assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
+        assert_eq!(cfg.bind, DEFAULT_BIND);
+
+        // Spelling the default bind out is not a "custom" bind and must not
+        // change the outcome either.
+        let cfg = load_with_toml(&format!("bind = \"{DEFAULT_BIND}\"\n")).unwrap();
+        assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
+    }
+
+    /// A bind that cannot be parsed as `host:port` is not guessed at: the
+    /// client falls back to the default URL instead of building a URL out of
+    /// a fragment. `serve` still reports the bad bind when it starts.
+    #[test]
+    fn an_unparseable_bind_falls_back_to_the_default_url() {
+        let cfg = load_with_toml("bind = \"not-a-bind\"\n").unwrap();
+        assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
+    }
+
     #[test]
     fn defaults_have_canonical_endings() {
         let cfg = Config::default();
@@ -3535,6 +4181,9 @@ mod tests {
         assert_eq!(cfg.decay.observation_retention_days, 0);
         assert_eq!(cfg.decay.observation_prune_batch, 5_000);
         assert!(!cfg.decay.observation_retention().is_enabled());
+        // Same contract for the hook event ledgers: kept unless opted in.
+        assert_eq!(cfg.decay.ledger_retention_months, 0);
+        assert!(!cfg.decay.ledger_retention().is_enabled());
         assert!(!cfg.slots.per_user);
         assert!(cfg.auto_improve.scheduler.enabled);
         assert_eq!(cfg.auto_improve.scheduler.interval_secs, 3_600);
@@ -4388,6 +5037,32 @@ mod tests {
         }
     }
 
+    /// A negative ledger age is rejected at load, like the observation age: a
+    /// destructive pass is never configured into a nonsensical shape. `0` is
+    /// the valid "disabled" value and loads.
+    #[test]
+    fn load_rejects_a_negative_ledger_retention() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[decay]\nledger_retention_months = -1\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect_err("a negative ledger retention must fail closed");
+        assert!(
+            error.to_string().contains("ledger_retention_months"),
+            "unexpected error: {error:#}"
+        );
+
+        std::fs::write(&config_path, "[decay]\nledger_retention_months = 0\n").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect("zero disables the pass and must load");
+        assert!(!cfg.decay.ledger_retention().is_enabled());
+
+        std::fs::write(&config_path, "[decay]\nledger_retention_months = 12\n").unwrap();
+        let cfg = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+            .expect("a positive age must load");
+        assert_eq!(cfg.decay.ledger_retention().months, 12);
+    }
+
     /// The consolidation budget must be big enough to leave room for
     /// observations after the fixed system prompt and page conventions.
     /// Below the floor every consolidation would be evidence-free, so it
@@ -4533,6 +5208,16 @@ max_input_tokens = {tokens}
         );
     }
 
+    #[test]
+    fn verbatim_residue_is_opt_in_and_loads_from_consolidation_settings() {
+        assert!(!ConsolidationSettings::default().verbatim_residue);
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[consolidation]\nverbatim_residue = true\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert!(config.consolidation.verbatim_residue);
+    }
+
     /// The small-context examples in `docs/install.md` and
     /// `docs/llm-providers.md` must be configs that actually load. These are
     /// the literal values those docs quote, copied by hand: keep them in step
@@ -4582,10 +5267,11 @@ input_token_safety_margin = {margin}
         .unwrap();
         let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
         assert_eq!(
-            config.ingest.drop_list,
-            ai_memory_hooks::IngestDropList::new(
+            config.ingest.drop_list.as_ref(),
+            &ai_memory_hooks::IngestDropList::new(
                 vec!["toolu_plugin_".into()],
-                vec!["mcp__noisy__poll".into()]
+                vec!["mcp__noisy__poll".into()],
+                &[]
             )
             .unwrap()
         );
@@ -4599,8 +5285,108 @@ input_token_safety_margin = {margin}
 
         // Default: empty, so nothing is dropped.
         assert_eq!(
-            Config::default().ingest.drop_list,
-            ai_memory_hooks::IngestDropList::default()
+            Config::default().ingest.drop_list.as_ref(),
+            &ai_memory_hooks::IngestDropList::default()
+        );
+    }
+
+    /// `[ingest] drop_events` names whole hook event kinds to drop (#1241
+    /// sibling). It loads into the same validated list the hook router checks,
+    /// defaults to empty (nothing dropped), and rejects a session-state kind
+    /// and an unknown kind at load.
+    #[test]
+    fn ingest_drop_events_load_into_the_router_list_and_reject_bad_kinds() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[ingest]\ndrop_events = [\"pre-tool-use\"]\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        // The raw value survives, and the validated list is built from it.
+        assert_eq!(config.ingest.drop_events, vec!["pre-tool-use".to_string()]);
+        assert_eq!(
+            config.ingest.drop_list.as_ref(),
+            &ai_memory_hooks::IngestDropList::new(Vec::new(), Vec::new(), &["pre-tool-use".into()])
+                .unwrap()
+        );
+
+        // A session-state kind fails startup with a clear error (session start…)
+        std::fs::write(
+            &config_path,
+            "[ingest]\ndrop_events = [\"session-start\"]\n",
+        )
+        .unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("session-start")
+                && format!("{error:#}").contains("session state"),
+            "{error:#}"
+        );
+
+        // …and session end.
+        std::fs::write(&config_path, "[ingest]\ndrop_events = [\"session-end\"]\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("session-end")
+                && format!("{error:#}").contains("session state"),
+            "{error:#}"
+        );
+
+        // An unknown kind fails startup naming the value.
+        std::fs::write(&config_path, "[ingest]\ndrop_events = [\"pre-tool-us\"]\n").unwrap();
+        let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("pre-tool-us")
+                && format!("{error:#}").contains("not a known hook event kind"),
+            "{error:#}"
+        );
+
+        // Default: empty, so nothing is dropped.
+        assert_eq!(Config::default().ingest.drop_events, Vec::<String>::new());
+        assert_eq!(
+            Config::default().ingest.drop_list.as_ref(),
+            &ai_memory_hooks::IngestDropList::default()
+        );
+    }
+
+    /// The env form of `[ingest] drop_events` (`AI_MEMORY_INGEST__DROP_EVENTS`,
+    /// a comma-separated string) loads into the same validated list. Uses the
+    /// child-process marker pattern because `std::env::set_var` is unsafe and
+    /// forbidden in this crate's multi-threaded test binary.
+    #[test]
+    fn ingest_drop_events_env_overrides_default() {
+        const CHILD_MARKER: &str = "AI_MEMORY_TEST_DROP_EVENTS_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let tmp = TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            // No drop_events in the file; the env var supplies it.
+            std::fs::write(&config_path, "[ingest]\n").unwrap();
+            let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+            assert_eq!(
+                config.ingest.drop_events,
+                vec!["pre-tool-use".to_string(), "stop".to_string()]
+            );
+            println!("drop-events-env-applied");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("config::tests::ingest_drop_events_env_overrides_default")
+            .arg("--test-threads=1")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env("AI_MEMORY_INGEST__DROP_EVENTS", "pre-tool-use,stop")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("drop-events-env-applied"),
+            "child stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
         );
     }
 
@@ -6308,6 +7094,80 @@ fn ambient_llm_base_url_still_configures_opencode() {
     assert_eq!(
         provider.base_url.as_deref(),
         Some("https://opencode.ai/zen/v1")
+    );
+}
+
+// --- `[sessions] idle_end_after_hours` ------------------------------
+
+/// The key defaults to `0` (off) when absent, parses from TOML, and the
+/// load-time bound rejects a year-plus value by naming the key.
+#[test]
+fn sessions_idle_end_defaults_off_loads_from_toml_and_rejects_out_of_range() {
+    use tempfile::TempDir;
+    assert_eq!(Config::default().sessions.idle_end_after_hours, 0);
+
+    let tmp = TempDir::new().unwrap();
+    let config_path = tmp.path().join("config.toml");
+    // Absent key keeps the default.
+    std::fs::write(&config_path, "# nothing\n").unwrap();
+    let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+    assert_eq!(config.sessions.idle_end_after_hours, 0);
+
+    // TOML parse.
+    std::fs::write(&config_path, "[sessions]\nidle_end_after_hours = 24\n").unwrap();
+    let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+    assert_eq!(config.sessions.idle_end_after_hours, 24);
+
+    // Boundary: one year is accepted.
+    std::fs::write(&config_path, "[sessions]\nidle_end_after_hours = 8760\n").unwrap();
+    let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+    assert_eq!(config.sessions.idle_end_after_hours, 8760);
+
+    // Above the bound the load fails and names the key.
+    std::fs::write(&config_path, "[sessions]\nidle_end_after_hours = 8761\n").unwrap();
+    let error = Config::load(Some(&config_path), Some(tmp.path().to_path_buf()))
+        .expect_err("above the bound must fail at load");
+    assert!(
+        error.to_string().contains("idle_end_after_hours"),
+        "unexpected error: {error:#}"
+    );
+}
+
+/// The env form `AI_MEMORY_SESSIONS__IDLE_END_AFTER_HOURS` outranks the
+/// TOML value, like every other flat config key.
+#[test]
+fn sessions_idle_end_env_overrides_config() {
+    use tempfile::TempDir;
+    const CHILD_MARKER: &str = "AI_MEMORY_TEST_SESSIONS_IDLE_END_CHILD";
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[sessions]\nidle_end_after_hours = 24\n").unwrap();
+        let config = Config::load(Some(&config_path), Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(config.sessions.idle_end_after_hours, 48);
+        println!("sessions-idle-end-env-applied");
+        return;
+    }
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("config::sessions_idle_end_env_overrides_config")
+        .arg("--test-threads=1")
+        .arg("--nocapture")
+        .env(CHILD_MARKER, "1")
+        .env("AI_MEMORY_SESSIONS__IDLE_END_AFTER_HOURS", "48")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child test failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("sessions-idle-end-env-applied"),
+        "child stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 

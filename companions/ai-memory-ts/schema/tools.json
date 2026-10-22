@@ -586,10 +586,22 @@
           "null"
         ]
       },
+      "kind": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
       "limit": {
         "type": [
           "integer",
           "null"
+        ]
+      },
+      "path_prefix": {
+        "type": [
+          "null",
+          "string"
         ]
       },
       "pin_first": {
@@ -637,6 +649,18 @@
           "type": "object"
         },
         "type": "array"
+      },
+      "tag": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "tier": {
+        "type": [
+          "null",
+          "string"
+        ]
       },
       "workspace": {
         "type": [
@@ -771,6 +795,40 @@
       }
     },
     "required": []
+  },
+  "memory_restore_page": {
+    "properties": {
+      "limit": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "path": {
+        "type": "string"
+      },
+      "project": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "rev": {
+        "type": [
+          "null",
+          "string"
+        ]
+      },
+      "workspace": {
+        "type": [
+          "null",
+          "string"
+        ]
+      }
+    },
+    "required": [
+      "path"
+    ]
   },
   "memory_status": {
     "properties": {

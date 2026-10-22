@@ -161,9 +161,9 @@ default_global = "true"
 # Optional. Inject a compiled project brief at session start (and after a
 # context clear — Claude Code re-fires SessionStart on /clear): the
 # session-start handoff fetch also returns this project's pinned /
-# `_rules/` / `_slots/` wiki pages (bodies included) plus recently-updated
-# page titles, so the agent starts with the architecture context instead
-# of re-exploring the codebase. Appended AFTER any pending handoff, and
+# `_rules/` / `_slots/` wiki pages plus recently-updated page titles, so the
+# agent starts with the architecture context instead of re-exploring the
+# codebase. Appended AFTER any pending handoff, and
 # unlike the handoff it is not consumed — it is recomposed every opted-in
 # session start. Only agents whose session-start hook injects stdout as
 # context benefit (Claude Code, Codex, OpenCode, …). Off by default: the
@@ -177,12 +177,17 @@ default_global = "true"
 inject_on_session_start = "true"
 
 # Optional. Char budget for the WHOLE brief (~4 chars per token), headers
-# and footers included. Bodies over budget are truncated with a visible
-# note; crowded-out core pages are listed by path so the agent can
-# `memory_query` them, degrading to a count when even the paths do not
-# fit. Page bodies are served first, then those pointer sections out of
-# what is left; the security notice and the untrusted-history markers are
-# never traded for content. Clamped server-side to [1500, 20000];
+# and footers included. Every core page first gets a short excerpt (its
+# frontmatter `abstract:` or `summary:`, else the prose it opens with); what is
+# left deepens pages to longer excerpts and then whole bodies, pinned and
+# `_slots/` pages first, then the cheapest bodies. A body is shown whole or
+# not at all, and a body shorter than its excerpt is always shown whole.
+# Four or more unpinned excerpts from one folder (`_rules/`, `gotchas/`,
+# `decisions/`, `procedures/`) share a heading. Pages the budget cannot
+# cover are listed by path so the agent can `memory_read_page` them,
+# degrading to a count when even the paths do not fit. Pin a page to give
+# it depth first. The security notice and the untrusted-history markers
+# are never traded for content. Clamped server-side to [1500, 20000];
 # defaults to 4000.
 max_chars = 4000
 
@@ -287,6 +292,16 @@ values are ignored and behave like the default `basename(cwd)` strategy.
 `[profile] contribute` and `consume` are on unless the value is explicitly
 falsy (`false` / `0` / `no` / `off`, quoted or bare). A marker that sets only
 `[profile]` keys is a settings boundary, like one with `[briefing]` keys.
+
+`[recall] default_global` applies to an agent's unscoped `memory_query` and
+`memory_recent` calls. A `memory_query` with `as_of` is not broadened: it
+reads the current project as it stood at that instant, and an explicit
+`global=true` with `as_of` is refused. The `ai-memory search` and
+`ai-memory recent` terminal commands do not read it: those commands stay
+scoped to the current project and cover every project only when you pass
+`--global` (see
+[usage.md](usage.md#search-from-the-terminal) and
+[usage.md](usage.md#recent-pages-from-the-terminal)).
 
 `default_global` and `inject_on_session_start` accept a truthy value
 (`true` / `1` / `yes` / `on`, quoted or bare; section-style keys are
@@ -886,7 +901,11 @@ The normal capture contract is intentionally narrow: supported Claude Code,
 OpenCode, Pi, OMP, and Antigravity tool events retain only canonical tool family,
 an agent-provided validated call ID when their documented schema proves one,
 and a PostToolUse outcome class. `PreToolUse` never retains commands,
-arguments, paths, input bodies, or arbitrary tool names. `PostToolUse` appends
+arguments, paths, input bodies, or arbitrary tool names. The one name kept is
+an MCP tool's: a call named `mcp__<server>__<tool>` (Claude Code, Codex, Hermes
+Agent) stays in the `unknown` family, with no input or output, and adds
+`mcp_server` and `mcp_tool` lines when the whole name is at most 64 ASCII
+letters, digits, `_` or `-`. `PostToolUse` appends
 its existing tool-response/error excerpt and caps the complete rendered body at
 2,000 UTF-8-safe bytes. Antigravity's successful file-edit events fall back to
 the bounded replacement or written-content field in `toolCall.args` because its

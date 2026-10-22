@@ -142,6 +142,11 @@ Initial source support is intentionally narrow:
   Observations are dropped unless replayed as `external-import` sessions
   through `/hook/batch`; records with no ai-memory counterpart are counted in
   the manifest. Details are in the importer README.
+- one explicitly selected local text/Markdown, text-layer PDF, DOCX, PPTX,
+  XLSX, VTT, or SRT document (`document`, Unix-only). Extraction is bounded and
+  sanitized, pages carry source digest and extractor provenance, and writes
+  use MCP `create_only` so reruns are idempotent and conflicts never overwrite
+  another page. OCR, images, and raw audio/video stay outside the companion.
 
 Future sources can include:
 
@@ -425,6 +430,54 @@ override is written only into the rendered LaunchAgent plist
 
 See [`docs/macos.md`](macos.md#scenario-d-menu-bar-app).
 
+## `ai-memory-desktop`: desktop installer
+
+A [Tauri v2](https://v2.tauri.app) app at
+[`companions/ai-memory-desktop`](../companions/ai-memory-desktop) for people
+who would rather not open a terminal (#1273, RFC #878 Phase 4). Its window
+starts on a plain HTML page and then shows the page `ai-memory setup --web`
+serves, so the whole setup UI and its safety rules stay in the CLI. There is
+no npm or JavaScript toolchain.
+
+It is not a root workspace member. Check it separately:
+
+```bash
+cargo clippy --locked --manifest-path companions/ai-memory-desktop/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path companions/ai-memory-desktop/Cargo.toml
+```
+
+### How it talks to ai-memory
+
+- Finds an existing `ai-memory` (the `install.sh`/`install.ps1` location,
+  `PATH`, the package-manager directories) and uses it as it is.
+- With none, copies the binary it carries (a Tauri sidecar) and the `hooks/`
+  bundle into the same per-user layout the scripts use, links
+  `~/.local/bin/ai-memory` when that name is free, and on Windows adds the
+  directory to the user `PATH`.
+- Runs `ai-memory setup --web --no-open --stop-on-stdin-eof` and navigates its
+  window to the address that command prints, accepting only the exact
+  `http://127.0.0.1:<port>/s/<secret>/` shape.
+
+It does not open SQLite or the wiki, call `/admin` routes, or add MCP tools.
+
+### Safety requirements
+
+- Never replace an existing install or someone else's `~/.local/bin/ai-memory`.
+- Never run `setup` from inside the bundle: the service it registers names the
+  binary it ran from, and a `.app` path, a replaced install directory or an
+  AppImage mount would stop the server from starting later.
+- The setup page is a remote origin to the webview and gets no Tauri
+  capability.
+- The setup page must not outlive the app: the app holds the child's stdin,
+  and `--stop-on-stdin-eof` stops it when the pipe closes.
+
+### Not done: signing
+
+CI builds unsigned installers on dispatch. They are previews and are not
+attached to releases until the project has an Apple Developer ID with
+notarization and a Windows Authenticode certificate. That decision, and its
+cost, belong to the maintainers (RFC #878).
+
 ## `ai-memory-ts`: TypeScript client SDK
 
 A typed client for programs that are not coding-agent harnesses (issue #1165):
@@ -630,10 +683,11 @@ unclaimed tree. Building the guard on ai-memory's captured
   (agentmemory #221), so by design there is no synchronous veto channel back to
   the harness.
 - **ai-memory does not retain the file paths.** For closed-tool agents the
-  stored observation is reduced to a `tool_family` label plus outcome; raw
-  arguments, paths, and tool names are extracted only transiently for
-  denylist matching, then dropped (`CaptureDecision` "never retains raw
-  arguments, paths, or arbitrary tool names"). A consumer can see *that* a file
+  stored observation is reduced to a `tool_family` label plus outcome (and an
+  MCP tool's validated server and tool names); raw arguments, paths, and other
+  tool names are extracted only transiently for denylist matching, then dropped
+  (`CaptureDecision` "never retains raw arguments, paths, or arbitrary tool
+  names"). A consumer can see *that* a file
   op happened in a session, never *which file*.
 
 Reversing either (persisting paths, or adding a blocking hook) would trade away a

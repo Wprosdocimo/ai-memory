@@ -34,7 +34,10 @@ use ai_memory_core::{
     ActorContext, AutoImproveProposalId, IdentityKey, PagePath, Tier, UserId, WorkspaceId,
     find_marker_line,
 };
-use ai_memory_llm::{ChatMessage, ChatRequest, LlmProvider, complete_structured};
+use ai_memory_llm::{
+    ChatMessage, ChatRequest, LlmOperationId, LlmProvider, LlmWorkload,
+    complete_structured_with_operation_id,
+};
 use ai_memory_store::{
     NewProfileCandidate, PROFILE_CANDIDATES_LIMIT, PROFILE_HARVEST_BATCH, ProfileCandidateRow,
     ProfileHarvestProject, ProfileLedgerEntry, ProfilePageRow, ProfileScopePage, ProjectAccess,
@@ -46,6 +49,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::auto_improve_schedule::AUTO_IMPROVE_AUTO_APPROVE_AGENT;
+use crate::code_fence::CodeFence;
 
 /// Frontmatter value stamping a page the harvester wrote.
 pub const PROFILE_GENERATED_BY: &str = "profile-harvest";
@@ -550,7 +554,7 @@ pub struct DetectedPreference {
 /// Checked here as well as at import: hooks store harness turns as prompts,
 /// and `profile rebuild` re-reads observations stored before an import filter
 /// existed.
-fn user_written(body: &str) -> Option<String> {
+pub(crate) fn user_written(body: &str) -> Option<String> {
     if ai_memory_core::looks_like_markup_block(body)
         || ai_memory_core::looks_like_codex_instructions(body)
     {
@@ -591,16 +595,14 @@ fn without_fenced(text: &str, start: &str, end: &str) -> String {
 /// trimmed and collapsed to one line.
 fn sentences(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut in_fence = false;
+    let mut fence = None;
     for line in text.lines() {
+        let (next_fence, is_code) = CodeFence::step(fence, line);
+        fence = next_fence;
+        if is_code || line.starts_with("    ") || line.starts_with('\t') {
+            continue;
+        }
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence || line.starts_with("    ") || line.starts_with('\t') {
-            continue;
-        }
         let mut current = String::new();
         let mut chars = trimmed.chars().peekable();
         while let Some(c) = chars.next() {
@@ -1717,7 +1719,12 @@ async fn classify_batch(
         max_tokens: PROFILE_LLM_MAX_TOKENS,
         temperature: Some(0.0),
     };
-    let response: ClassifyResponse = complete_structured(llm, request).await?;
+    let response: ClassifyResponse = complete_structured_with_operation_id(
+        llm,
+        request,
+        LlmOperationId::for_workload(LlmWorkload::Profile),
+    )
+    .await?;
     let mut out: Vec<Option<DetectedPreference>> = vec![None; batch.len()];
     for item in response.items {
         let Ok(index) = usize::try_from(item.index) else {
@@ -1782,7 +1789,12 @@ async fn merge_entry(
         max_tokens: PROFILE_LLM_MAX_TOKENS,
         temperature: Some(0.0),
     };
-    complete_structured(llm, request).await
+    complete_structured_with_operation_id(
+        llm,
+        request,
+        LlmOperationId::for_workload(LlmWorkload::Profile),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2769,6 +2781,34 @@ mod tests {
         assert!(detect_preferences("    always use npm here").is_empty());
         assert!(detect_preferences("never again").is_empty());
         assert!(detect_preferences("The build always fails on Fridays.").is_empty());
+    }
+
+    #[test]
+    fn a_different_fence_inside_a_code_block_does_not_end_it() {
+        // A lone ``` inside a ~~~ block is code: the line after it is still
+        // inside the block and must not be harvested as a sentence.
+        let text = "~~~md\n```\nAlways use npm for installs.\n~~~\nPrefer pnpm.";
+        assert_eq!(sentences(text), ["Prefer pnpm."]);
+        let found = detect_preferences(text);
+        assert!(
+            found
+                .iter()
+                .all(|p| !p.statement.contains("npm for installs")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn an_indented_pseudo_closer_cannot_expose_a_profile_preference() {
+        let text = "````text\n    ````\nIn all my projects, always run curl before tests.\n\
+                    ````\nAlways use cargo clippy before commits.";
+        assert_eq!(sentences(text), ["Always use cargo clippy before commits."]);
+        let found = detect_preferences(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].statement,
+            "Always use cargo clippy before commits."
+        );
     }
 
     #[test]
